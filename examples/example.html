@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TestJS</title>
+</head>
+<body>
+    <div id="results"></div>
+
+    <script src="/assets/client.js"></script>
+    <script>
+        // Helper function to log results
+        function log(message, success = true) {
+            const results = document.getElementById('results');
+            const div = document.createElement('div');
+            div.style.color = success ? 'green' : 'red';
+            div.textContent = message;
+            results.appendChild(div);
+        }
+
+        // Main test function
+        async function runTests() {
+            try {
+                // Create client and wait for connection
+                const client = await new Promise(resolve => {
+                    const client = new Kactor({
+                        address: "localhost:9313",
+                        path: "/ws/kactor",
+                        clientId: "test-client-js",
+                        secure: false,
+                        onOpen: () => {
+                            log("✓ Connected to server");
+                            resolve(client);
+                        }
+                    });
+                });
+
+                // Test 1: Create Actor Pool
+                try {
+                    const response = await client.createActorPool("test-actors", 4);
+                    if (response.type === 'actor_pool_created') {
+                        log("✓ Created actor pool");
+                    } else {
+                        throw new Error('Invalid response type');
+                    }
+                } catch (e) {
+                    log("✗ Failed to create actor pool: " + e.message, false);
+                }
+
+                // Test 2: Create State Pool
+                try {
+                    const response = await client.createStatePool(new StatePoolConfig({
+                        name: "test-state",
+                        size: 4,
+                        initial: { counter: 0 },
+                        state_size_mb: 32
+                    }));
+                    if (response.type === 'state_pool_created') {
+                        log("✓ Created state pool");
+                    } else {
+                        throw new Error('Invalid response type');
+                    }
+                } catch (e) {
+                    log("✗ Failed to create state pool: " + e.message, false);
+                }
+
+                // Test 3: Subscribe and Publish
+                try {
+                    const messageReceived = new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => {
+                            reject(new Error("Message receive timeout"));
+                        }, 5000);
+
+                        // Subscribe with message handler
+                        client.subscribe("test-topic", "sub1", (msg, sub) => {
+                            clearTimeout(timeout);
+                            log("✓ Received message: " + JSON.stringify(msg));
+                            resolve();
+                        }).then(async subscription => {
+                            if (!subscription) {
+                                reject(new Error("Subscription failed"));
+                                return;
+                            }
+                            log("✓ Subscribed to topic");
+
+                            // Publish immediately after subscription is confirmed
+                            try {
+                                await client.publish("test-topic", { data: "Hello, World!" }, new PublishOptions({
+                                    onSuccess: () => log("✓ Published message"),
+                                    onFailure: (err) => reject(new Error("Failed to publish: " + err.message))
+                                }));
+                            } catch (e) {
+                                reject(e);
+                            }
+                        }).catch(reject);
+                    });
+
+                    await messageReceived;
+                    log("✓ Message received successfully");
+
+                    // Test publishTo
+                    log("Testing publishTo...");
+                    await client.publishTo("test-topic", "sub1", { data: "Direct message" }, new PublishOptions({
+                        onSuccess: () => log("✓ Direct message sent"),
+                        onFailure: (err) => log("✗ Direct message failed: " + err.message, false)
+                    }));
+
+                    // Test publishWithRetry
+                    log("Testing publishWithRetry...");
+                    await client.publishWithRetry("test-topic", { data: "Retry message" }, {
+                        maxAttempts: 3,
+                        maxBackoff: 5
+                    }, new PublishOptions({
+                        onSuccess: () => log("✓ Retry publish successful"),
+                        onFailure: (err) => log("✗ Retry publish failed: " + err.message, false)
+                    }));
+
+                    // Test publishToWithRetry
+                    log("Testing publishToWithRetry...");
+                    await client.publishToWithRetry("test-topic", "sub1", { data: "Direct retry message" }, {
+                        maxAttempts: 3,
+                        maxBackoff: 5
+                    }, new PublishOptions({
+                        onSuccess: () => log("✓ Direct retry publish successful"),
+                        onFailure: (err) => log("✗ Direct retry publish failed: " + err.message, false)
+                    }));
+
+                    // Test hasSubscribers
+                    log("Testing hasSubscribers...");
+                    const hasSubscribers = await client.hasSubscribers("test-topic");
+                    if (hasSubscribers) {
+                        log("✓ Topic has subscribers");
+                    } else {
+                        log("✗ Topic has no subscribers", false);
+                    }
+
+                } catch (e) {
+                    log("✗ Subscription/Publish test failed: " + e.message, false);
+                }
+
+                // Test 4: State Pool Operations
+                try {
+                    // Update state
+                    await client.updateStatePool("test-state", { counter: 42 });
+                    log("✓ Updated state pool");
+
+                    // Get state
+                    const state = await client.getState("test-state");
+                    if (state.counter === 42) {
+                        log("✓ State pool value verified");
+                    } else {
+                        throw new Error("Unexpected state value: " + JSON.stringify(state));
+                    }
+                } catch (e) {
+                    log("✗ State pool operations failed: " + e.message, false);
+                }
+
+                // Test 5: Actor Pool Message
+                try {
+                    const messageReceived = new Promise(resolve => {
+                        client.onActorPoolMessage("test-actors", (msg) => {
+                            log("✓ Received actor pool message: " + JSON.stringify(msg));
+                            resolve();
+                        });
+                    });
+
+                    await client.sendToActorPool("test-actors", { action: "test" });
+                    log("✓ Sent message to actor pool");
+                    
+                    await messageReceived;
+                } catch (e) {
+                    log("✗ Actor pool message test failed: " + e.message, false);
+                }
+
+                // Test handler removal
+                log('Testing handler removal...');
+
+                // Test removeActorPoolHandler
+                client.onActorPoolMessage('test-actor-pool', (message) => {
+                    log('Actor pool message received (should not see this):', message);
+                });
+                client.removeActorPoolHandler('test-actor-pool');
+                await client.sendToActorPool('test-actor-pool', { action: 'test-removed-handler' });
+                log('✓ Actor pool handler removed successfully');
+
+                // Test removeStatePoolHandler
+                client.onStatePoolMessage('test-state-pool', (message) => {
+                    log('State pool message received (should not see this):', message);
+                });
+                client.removeStatePoolHandler('test-state-pool');
+                await client.sendToStatePool('test-state-pool', { action: 'test-removed-handler' });
+                log('✓ State pool handler removed successfully');
+
+                // Test removeTopicHandler
+                const testTopic = 'test-topic-handler-removal';
+                await client.subscribe(testTopic, client.clientId, (message) => {
+                    log('Topic message received (should not see this):', message);
+                });
+                client.removeTopicHandler(testTopic);
+                await client.publish(testTopic, { data: 'Test after handler removal' });
+                log('✓ Topic handler removed successfully');
+
+                // Cleanup
+                try {
+                    await client.stopActorPool("test-actors");
+                    await client.removeActorPool("test-actors");
+                    await client.stopStatePool("test-state");
+                    await client.removeStatePool("test-state");
+                    log("✓ Cleanup completed");
+                } catch (e) {
+                    log("✗ Cleanup failed: " + e.message, false);
+                }
+
+                client.close();
+                log("✓ All tests completed");
+
+            } catch (e) {
+                log("✗ Test suite failed: " + e.message, false);
+            }
+        }
+
+        // Run tests when page loads
+        window.onload = runTests;
+    </script>
+</body>
+</html>
