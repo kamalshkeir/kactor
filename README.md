@@ -10,6 +10,73 @@ A modern, high-performance distributed computing framework that combines:
 [![Go Report Card](https://goreportcard.com/badge/github.com/kamalshkeir/kactor)](https://goreportcard.com/report/github.com/kamalshkeir/kactor)
 [![GoDoc](https://godoc.org/github.com/kamalshkeir/kactor?status.svg)](https://godoc.org/github.com/kamalshkeir/kactor)
 
+## Power of kactor: Real-World Example
+
+Here's how kactor elegantly handles a complex multiplayer game server with real-time physics, AI, and state management:
+
+```python
+# Game Server Architecture using kactor
+
+# 1. Create specialized actor pools for concurrent processing
+await client.create_actor_pool("game-rooms", size=4)      # Handles game rooms
+await client.create_actor_pool("physics", size=8)         # Physics calculations
+await client.create_actor_pool("ai", size=2)              # AI processing
+
+# 2. Distributed state management
+await client.create_state_pool(StatePoolConfig(
+    name="game-state",
+    size=4,
+    initial={
+        "rooms": {},
+        "players": {},
+        "world_state": {}
+    },
+    state_size_mb=64
+))
+
+# 3. Pattern-based message routing with zero-allocation pub/sub
+# Route player movements to physics actors
+await client.subscribe("player.move", "physics-sub", 
+    lambda msg, _: client.send_to_actor_pool("physics", {
+        "type": "movement",
+        "data": msg
+    }))
+
+# Pattern matching for room events (room.* matches room.join, room.leave, etc.)
+await client.subscribe("room.*", "room-sub",
+    lambda msg, sub: client.send_to_actor_pool("game-rooms", {
+        "type": "room_event",
+        "topic": sub.get_topic(),
+        "data": msg
+    }))
+
+# AI behavior processing
+await client.subscribe("npc.behavior", "ai-sub",
+    lambda msg, _: client.send_to_actor_pool("ai", {
+        "type": "behavior_update",
+        "data": msg
+    }))
+
+# 4. Real-time state updates and broadcasts
+client.on_actor_pool_message("physics", async def handle_physics(msg):
+    # Process physics
+    result = process_physics(msg["data"])
+    # Atomic state updates
+    await client.update_state_pool("game-state", {
+        f"players.{msg['data']['player_id']}.position": result["new_position"]
+    })
+    # Broadcast updates to room participants
+    await client.publish(f"room.{msg['data']['room_id']}.update", result))
+```
+
+This example demonstrates kactor's key strengths:
+- **Concurrent Processing**: Dedicated actor pools for different game systems
+- **Pattern Matching**: Intelligent message routing using wildcards (e.g., `room.*`)
+- **State Management**: Distributed state with atomic updates
+- **Real-time Performance**: Zero-allocation messaging with < 200ns latency
+- **Scalability**: Independent scaling of physics, AI, and room management
+- **Clean Architecture**: Clear separation of concerns with topic-based routing
+
 ## Features
 
 - 🚀 **High Performance**: Zero-allocation pub/sub with nanosecond latencies
@@ -85,7 +152,7 @@ client = Kactor(KactorConfig(
 await client.create_actor_pool("my-actors", size=4)
 
 # Subscribe to messages
-await client.subscribe("my-topic", "sub1", lambda msg, sub: print(f"Received: {msg}"))
+await client.subscribe("my-topic", "sub1", lambda msg, sub: print(f"Received message on {sub.get_topic()}: {msg}"))
 
 # Publish with retry
 await client.publish_with_retry("my-topic", {"data": "Hello!"}, RetryConfig(
