@@ -8,31 +8,24 @@ import (
 )
 
 // PUBSUB
-// PubSub implements a minimal allocation pubsub system
 type PubSub struct {
-	subscribers kmap.SafeMap[string, *psSubList]
-	patterns    kmap.SafeMap[string, *psSubList]
-	userCount   int32
+	subscribers *kmap.SafeMap[string, *psSubList]
+	patterns    *kmap.SafeMap[string, *psSubList]
+	pendingMsgs *kmap.SafeMap[string, *PublishOptions]
+
+	// Pre-allocated buffers for common topics
+	topicBufs [32][]byte
+	topicLen  [32]int32
+
 	msgPool     sync.Pool
 	payloadPool sync.Pool
 	idPool      sync.Pool
-	closed      int32
-	debug       bool
-	// Pre-allocated buffers for common topics
-	topicBufs   [32][]byte
-	topicLen    [32]int32
-	pendingMsgs kmap.SafeMap[string, *PublishOptions]
-
 	// Object pools
-	subsPool sync.Pool
-	bufPool  sync.Pool
-
-	// Configuration
-	config struct {
-		maxSubscribersPerTopic int32
-		maxTopicLength         int32
-		maxPayloadSize         int32
-	}
+	subsPool  sync.Pool
+	bufPool   sync.Pool
+	userCount int32
+	closed    int32
+	debug     bool
 }
 
 type WSMessage struct {

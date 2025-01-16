@@ -16,9 +16,9 @@ import (
 // NewPubSub creates a new PubSub
 func NewPubSub() *PubSub {
 	ps := &PubSub{
-		subscribers: *kmap.New[string, *psSubList](32),
-		patterns:    *kmap.New[string, *psSubList](32),
-		pendingMsgs: *kmap.New[string, *PublishOptions](32),
+		subscribers: kmap.New[string, *psSubList](32),
+		patterns:    kmap.New[string, *psSubList](32),
+		pendingMsgs: kmap.New[string, *PublishOptions](32),
 	}
 
 	ps.msgPool = sync.Pool{
@@ -228,7 +228,7 @@ func (ps *PubSub) Subscribe(topic, subID string, handler func(map[string]any, Su
 
 	// Check if it's a pattern subscription
 	if strings.ContainsAny(topic, "+*") {
-		list := ps.getOrCreateList(&ps.patterns, topic)
+		list := ps.getOrCreateList(ps.patterns, topic)
 		list.mu.Lock()
 		defer list.mu.Unlock()
 
@@ -254,7 +254,7 @@ func (ps *PubSub) Subscribe(topic, subID string, handler func(map[string]any, Su
 	}
 
 	// Direct subscription
-	list := ps.getOrCreateList(&ps.subscribers, topic)
+	list := ps.getOrCreateList(ps.subscribers, topic)
 	list.mu.Lock()
 	defer list.mu.Unlock()
 
@@ -886,14 +886,6 @@ func (ps *PubSub) retryPublish(topic string, msgID string, unackedSubs []string)
 	ps.putPayload(payload)
 }
 
-// WithConfig sets configuration options
-func (ps *PubSub) WithConfig(maxSubs, maxTopicLen, maxPayloadSize int32) *PubSub {
-	ps.config.maxSubscribersPerTopic = maxSubs
-	ps.config.maxTopicLength = maxTopicLen
-	ps.config.maxPayloadSize = maxPayloadSize
-	return ps
-}
-
 // SubscribeWS adds a subscriber with a WebSocket connection reference
 func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, Subscription), conn *ws.Conn) Subscription {
 	atomic.AddInt32(&ps.userCount, 1)
@@ -903,7 +895,7 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 
 	// Check if it's a pattern subscription
 	if strings.ContainsAny(topic, "+*") {
-		list := ps.getOrCreateList(&ps.patterns, topic)
+		list := ps.getOrCreateList(ps.patterns, topic)
 		list.mu.Lock()
 		defer list.mu.Unlock()
 
@@ -933,7 +925,7 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 	}
 
 	// Direct subscription
-	list := ps.getOrCreateList(&ps.subscribers, topic)
+	list := ps.getOrCreateList(ps.subscribers, topic)
 	list.mu.Lock()
 	defer list.mu.Unlock()
 
