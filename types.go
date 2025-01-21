@@ -37,6 +37,15 @@ type WSMessage struct {
 	MsgID   string         `json:"msg_id,omitempty"`  // Unique message ID for acknowledgment
 }
 
+func (msg *WSMessage) reset() {
+	clear(msg.Payload)
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = ""
+	msg.Type = ""
+	msg.MsgID = ""
+}
+
 type RetryConfig struct {
 	MaxAttempts int
 	MaxBackoff  int // maximum number of yields (runtime.Gosched()) in backoff

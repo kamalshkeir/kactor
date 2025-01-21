@@ -1,14 +1,17 @@
 package kactor
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
 
+	"encoding/json"
+
 	"github.com/kamalshkeir/kmap"
 	"github.com/kamalshkeir/ksmux"
 	"github.com/kamalshkeir/ksmux/ws"
+	"github.com/kamalshkeir/ksmux/wspool"
 )
 
 var ErrUpgradeWs = errors.New("error init websocket connection")
@@ -26,22 +29,33 @@ func (m PoolMessage) GetData() any {
 	return m.Data
 }
 
+// MessageContext holds the message and its associated connection
+type MessageContext struct {
+	msg  *WSMessage
+	conn *wspool.Conn
+}
+
 // BusServer handles WebSocket connections and message routing
 type BusServer struct {
-	id           string
-	app          *ksmux.Router
-	bus          *PubSub
-	path         string
-	onServerData func(map[string]any)
-	// Server-to-server connections
+	app             *ksmux.Router
+	bus             *PubSub
+	path            string
+	debug           bool
+	pools           *kmap.SafeMap[string, *StatefulActorPool]
+	actorPools      *kmap.SafeMap[string, *ActorPool]
 	busServersConns *kmap.SafeMap[string, *Client]
-	// Stateful actor pools
-	pools *kmap.SafeMap[string, *StatefulActorPool]
-	// Regular actor pools
-	actorPools *kmap.SafeMap[string, *ActorPool]
-	// Debug mode
-	debug bool
-	mu    sync.RWMutex // For thread-safe operations
+	onServerData    func(map[string]any)
+	// Message pool for better memory reuse
+	messagePool *MessagePool
+	// Connection tracking
+	connections *kmap.SafeMap[string, *wspool.Conn]
+	// Batch processing channels
+	batchSize int
+	batchChan chan *MessageContext
+	// Add write buffer pool
+	writeBufferPool sync.Pool
+	// Add JSON encoder pool
+	encoderPool sync.Pool
 }
 
 // debugLog prints debug messages if debug mode is enabled
@@ -51,39 +65,19 @@ func (b *BusServer) debugLog(format string, args ...interface{}) {
 	}
 }
 
-// SafeConn wraps a WebSocket connection with synchronized writes
-type SafeConn struct {
-	conn *ws.Conn
-	mu   sync.Mutex
-}
-
-// WriteJSON safely writes a JSON message to the connection
-func (sc *SafeConn) WriteJSON(v interface{}) error {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return sc.conn.WriteJSON(v)
-}
-
-// ReadMessage safely reads a message from the connection
-func (sc *SafeConn) ReadMessage() (messageType int, p []byte, err error) {
-	return sc.conn.ReadMessage()
-}
-
-// Close closes the underlying connection
-func (sc *SafeConn) Close() error {
-	return sc.conn.Close()
-}
-
 func NewBusServer(config ...ksmux.Config) *BusServer {
 	var conf *ksmux.Config
 	if len(config) > 0 {
 		conf = &config[0]
 	}
 	if conf == nil {
-		conf = &ksmux.Config{}
+		conf = &ksmux.Config{
+			Address: "localhost:9313",
+		}
 	}
 	ps := NewPubSub()
 	app := ksmux.New(*conf)
+
 	b := &BusServer{
 		app:             app,
 		bus:             ps,
@@ -92,11 +86,29 @@ func NewBusServer(config ...ksmux.Config) *BusServer {
 		pools:           kmap.New[string, *StatefulActorPool](32),
 		actorPools:      kmap.New[string, *ActorPool](32),
 		busServersConns: kmap.New[string, *Client](32),
+		messagePool:     NewMessagePool(),
+		connections:     kmap.New[string, *wspool.Conn](32),
+		batchSize:       100,
+		batchChan:       make(chan *MessageContext, 1000),
+		// Initialize buffer pool
+		writeBufferPool: sync.Pool{
+			New: func() interface{} {
+				return bytes.NewBuffer(make([]byte, 0, 1024))
+			},
+		},
+		// Initialize encoder pool
+		encoderPool: sync.Pool{
+			New: func() interface{} {
+				return json.NewEncoder(bytes.NewBuffer(nil))
+			},
+		},
 	}
+
 	// Add shutdown handlers
 	app.OnShutdown(func() error {
 		ps.Close()
 		b.CloseServerConnections()
+		wspool.CleanUpActors()
 		// Stop all actor pools
 		b.pools.Range(func(_ string, pool *StatefulActorPool) bool {
 			pool.acpool.Stop()
@@ -108,7 +120,630 @@ func NewBusServer(config ...ksmux.Config) *BusServer {
 		})
 		return nil
 	})
+
 	return b
+}
+
+func (b *BusServer) HandleWS(c *ksmux.Context) {
+	rawConn, err := wspool.UpgradeConnection(c.ResponseWriter, c.Request, nil)
+	if err != nil {
+		if b.debug {
+			b.debugLog("[HandleWS] WebSocket upgrade failed: %v", err)
+		}
+		c.Error(ErrUpgradeWs)
+		return
+	}
+	conn := wspool.DefaultPool().Add(rawConn)
+	if conn == nil {
+		if b.debug {
+			b.debugLog("[HandleWS] ERROR: couldn't add to pool")
+		}
+		c.Error("could not add to pool")
+		return
+	}
+
+	var clientID string
+	// Ensure cleanup happens when the connection is closed
+	defer func() {
+		if b.debug {
+			b.debugLog("[HandleWS] Cleaning connection client %s", clientID)
+		}
+		b.connections.Delete(clientID)
+		conn.Close()
+	}()
+
+	// Handle incoming messages
+	for {
+		var msg *WSMessage
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			if ws.IsCloseError(err, ws.CloseNormalClosure, ws.CloseGoingAway) {
+				if b.debug {
+					b.debugLog("[HandleWS] Client closed connection normally")
+				}
+			} else if !ws.IsUnexpectedCloseError(err, ws.CloseNormalClosure, ws.CloseGoingAway) {
+				if b.debug {
+					b.debugLog("[HandleWS] WebSocket error %v", err)
+				}
+			}
+			return
+		}
+
+		// Store client ID for cleanup and connection tracking
+		if msg.ID != "" {
+			if conn.GetClientID() != msg.ID {
+				conn.SetClientID(msg.ID)
+			}
+			clientID = msg.ID
+			b.connections.Set(clientID, conn)
+		}
+
+		if b.debug {
+			b.debugLog("[HandleWS] Received message: type=%s, topic=%s, id=%s", msg.Type, msg.Topic, msg.ID)
+		}
+
+		switch msg.Type {
+		case "publish":
+			if b.debug {
+				b.debugLog("[handlerPublish] got msg %+v", msg)
+			}
+			noAck := false
+			if na, ok := msg.Payload["no_ack"].(bool); ok {
+				noAck = na
+				delete(msg.Payload, "no_ack")
+			}
+			if !noAck {
+				po := &PublishOptions{
+					OnSuccess: func() {
+						response := b.messagePool.Get()
+						response.Type = "published"
+						response.Topic = msg.Topic
+						response.ID = msg.ID
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+					OnFailure: func(err error) {
+						response := b.messagePool.Get()
+						response.Type = "error"
+						response.ID = msg.ID
+						response.Payload["error"] = err.Error()
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+				}
+				success := b.bus.Publish(msg.Topic, msg.Payload, po)
+				if !success {
+					response := b.messagePool.Get()
+					response.Type = "error"
+					response.ID = msg.ID
+					response.Payload["error"] = "no subscribers found"
+					_ = conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				}
+			} else {
+				_ = b.bus.Publish(msg.Topic, msg.Payload, nil)
+			}
+		case "publishTo":
+			if b.debug {
+				b.debugLog("[handlerPublishTo] got msg %+v", msg)
+			}
+			noAck := false
+			if na, ok := msg.Payload["no_ack"].(bool); ok {
+				noAck = na
+				delete(msg.Payload, "no_ack")
+			}
+			if !noAck {
+				success := b.bus.PublishTo(msg.Topic, msg.Target, msg.Payload, &PublishOptions{
+					OnSuccess: func() {
+						response := b.messagePool.Get()
+						response.Type = "published"
+						response.Topic = msg.Topic
+						response.ID = msg.ID
+						response.Target = msg.Target
+						clear(response.Payload)
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+					OnFailure: func(err error) {
+						response := b.messagePool.Get()
+						response.Type = "error"
+						response.ID = msg.ID
+						response.Topic = msg.Topic
+						response.Target = msg.Target
+						clear(response.Payload)
+						response.Payload["error"] = err.Error()
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+				})
+				if !success {
+					if b.debug {
+						b.debugLog("Failed to publish direct message to topic %s, target %s", msg.Topic, msg.Target)
+					}
+					response := b.messagePool.Get()
+					response.Type = "error"
+					response.ID = msg.ID
+					response.Topic = msg.Topic
+					response.Target = msg.Target
+					clear(response.Payload)
+					response.Payload["error"] = "Failed to publish direct message to topic=" + msg.Topic + ", target=" + msg.Target
+					conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				}
+			} else {
+				_ = b.bus.PublishTo(msg.Topic, msg.Target, msg.Payload, nil)
+			}
+		case "publishWithRetry":
+			if b.debug {
+				b.debugLog("[handlerPublishWithRetry] got msg %+v", msg)
+			}
+			noAck := false
+			if na, ok := msg.Payload["no_ack"].(bool); ok {
+				noAck = na
+				delete(msg.Payload, "no_ack")
+			}
+			var cfg RetryConfig
+			if cfgData, ok := msg.Payload["retry_config"].(map[string]any); ok {
+				if maxAttempts, ok := cfgData["max_attempts"].(float64); ok {
+					cfg.MaxAttempts = int(maxAttempts)
+				}
+				if maxBackoff, ok := cfgData["max_backoff"].(float64); ok {
+					cfg.MaxBackoff = int(maxBackoff)
+				}
+			}
+			if cfg.MaxAttempts == 0 {
+				cfg = DefaultRetryConfig
+			}
+
+			dmap, ok := msg.Payload["data"].(map[string]any)
+			if !ok {
+				dmap = map[string]any{
+					"data": msg.Payload["data"],
+				}
+			}
+
+			if !noAck {
+				success := b.bus.PublishWithRetry(msg.Topic, dmap, &cfg, &PublishOptions{
+					OnSuccess: func() {
+						response := b.messagePool.Get()
+						response.Type = "published"
+						response.Topic = msg.Topic
+						response.Target = msg.Target
+						response.ID = msg.ID
+						clear(response.Payload)
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+					OnFailure: func(err error) {
+						response := b.messagePool.Get()
+						response.Type = "error"
+						response.ID = msg.ID
+						response.Topic = msg.Topic
+						response.Target = msg.Target
+						clear(response.Payload)
+						response.Payload["error"] = err.Error()
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+				})
+				if !success {
+					if b.debug {
+						b.debugLog("Failed to publish with retry to topic %s", msg.Topic)
+					}
+					response := b.messagePool.Get()
+					response.Type = "error"
+					response.ID = msg.ID
+					response.Topic = msg.Topic
+					response.Target = msg.Target
+					// Clear and reuse payload map
+					clear(response.Payload)
+					response.Payload["error"] = fmt.Errorf("Failed to publish with retry to topic %s", msg.Topic)
+					conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				}
+			} else {
+				_ = b.bus.PublishWithRetry(msg.Topic, dmap, &cfg, nil)
+			}
+		case "publishToWithRetry":
+			if b.debug {
+				b.debugLog("[handlerPublishToWithRetry] got msg %+v", msg)
+			}
+			noAck := false
+			if na, ok := msg.Payload["no_ack"].(bool); ok {
+				noAck = na
+				delete(msg.Payload, "no_ack")
+			}
+			var cfg RetryConfig
+			if cfgData, ok := msg.Payload["retry_config"].(map[string]any); ok {
+				if maxAttempts, ok := cfgData["max_attempts"].(float64); ok {
+					cfg.MaxAttempts = int(maxAttempts)
+				}
+				if maxBackoff, ok := cfgData["max_backoff"].(float64); ok {
+					cfg.MaxBackoff = int(maxBackoff)
+				}
+			}
+			if cfg.MaxAttempts == 0 {
+				cfg = DefaultRetryConfig
+			}
+
+			if !noAck && msg.Target == "" {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				clear(response.Payload)
+				response.Payload["error"] = "target field is required for publishTo"
+				conn.WriteJSON(response)
+				// Return the original message to the pool
+				b.messagePool.Put(response)
+				continue
+			}
+
+			dmap, ok := msg.Payload["data"].(map[string]any)
+			if !ok {
+				dmap = map[string]any{
+					"data": msg.Payload["data"],
+				}
+			}
+
+			if !noAck {
+				success := b.bus.PublishToWithRetry(msg.Topic, msg.Target, dmap, &cfg, &PublishOptions{
+					OnSuccess: func() {
+						response := b.messagePool.Get()
+						response.Type = "published"
+						response.Topic = msg.Topic
+						response.Target = msg.Target
+						response.ID = msg.ID
+						clear(response.Payload)
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+					OnFailure: func(err error) {
+						response := b.messagePool.Get()
+						response.Type = "error"
+						response.ID = msg.ID
+						response.Topic = msg.Topic
+						response.Target = msg.Target
+						clear(response.Payload)
+						response.Payload["error"] = err.Error()
+						conn.WriteJSON(response)
+						b.messagePool.Put(response)
+					},
+				})
+				if !success {
+					if b.debug {
+						b.debugLog("Failed to publish direct message with retry to topic %s, target %s", msg.Topic, msg.Target)
+					}
+					response := b.messagePool.Get()
+					response.Type = "error"
+					response.ID = msg.ID
+					response.Topic = msg.Topic
+					response.Target = msg.Target
+					clear(response.Payload)
+					response.Payload["error"] = "Failed to publish direct message with retry to topic=" + msg.Topic + ", target " + msg.Target + ""
+					conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				}
+			} else {
+				_ = b.bus.PublishToWithRetry(msg.Topic, msg.Target, dmap, &cfg, nil)
+			}
+		case "subscribe":
+			if b.debug {
+				b.debugLog("[handlerSubscribe] got msg %+v", msg)
+			}
+			sub := b.bus.Subscribe(msg.Topic, msg.Target, func(payload map[string]any, sub Subscription) {
+				response := b.messagePool.Get()
+				response.Type = "message"
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				response.ID = msg.ID
+				response.Payload = payload
+				// Send response and return to pool
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			})
+
+			if sub == nil {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				clear(response.Payload)
+				response.Payload["error"] = "failed to subscribe"
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+				continue
+			}
+			response := b.messagePool.Get()
+			response.Type = "subscribed"
+			response.Topic = msg.Topic
+			response.ID = msg.ID
+			clear(response.Payload)
+			response.Payload["subID"] = msg.Target
+			err := conn.WriteJSON(response)
+			if err != nil && b.debug {
+				b.debugLog("unable to send subscribed response to %s %w", msg.ID, err)
+			}
+			b.messagePool.Put(response)
+		case "unsubscribe":
+			if b.debug {
+				b.debugLog("[handlerUnsubscribe] got msg %+v", msg)
+			}
+			// Extract subscription ID from payload or use message ID
+			subID := msg.ID
+			if sid, ok := msg.Payload["subID"].(string); ok && sid != "" {
+				subID = sid
+			}
+
+			if b.bus.Unsubscribe(msg.Topic, subID) {
+				response := b.messagePool.Get()
+				response.Type = "unsubscribed"
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["subID"] = subID
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			} else {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				clear(response.Payload)
+				response.Payload["error"] = "unsubscribe failed: subscription not found"
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			}
+
+		case "send_to_server":
+			// Handle sending message to another server
+			serverAddr, ok := msg.Payload["server_addr"].(string)
+			if !ok {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				clear(response.Payload)
+				response.Payload["error"] = "missing or invalid server_addr"
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+
+				if b.debug {
+					b.debugLog("[HandleWS] Invalid server_addr in send_to_server message")
+				}
+				continue
+			}
+
+			data, ok := msg.Payload["data"].(map[string]any)
+			if !ok {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = "missing or invalid data"
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+
+				if b.debug {
+					b.debugLog("[HandleWS] Invalid data in send_to_server message")
+				}
+				continue
+			}
+
+			// Get custom path if provided
+			var path []string
+			if customPath, ok := msg.Payload["path"].(string); ok {
+				path = []string{customPath}
+			}
+
+			// Send message to other server
+			success := b.PublishToServer(serverAddr, data, &PublishOptions{
+				OnSuccess: func() {
+					response := b.messagePool.Get()
+					response.Type = "published"
+					response.ID = msg.ID
+					response.Topic = msg.Topic
+					response.Target = msg.Target
+					clear(response.Payload)
+					response.Payload["server_addr"] = serverAddr
+					conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				},
+				OnFailure: func(err error) {
+					response := b.messagePool.Get()
+					response.Type = "error"
+					response.ID = msg.ID
+					response.Topic = msg.Topic
+					response.Target = msg.Target
+					clear(response.Payload)
+					response.Payload["error"] = err.Error()
+					response.Payload["server_addr"] = serverAddr
+					conn.WriteJSON(response)
+					b.messagePool.Put(response)
+				},
+			}, path...)
+
+			if !success {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				response.Topic = msg.Topic
+				response.Target = msg.Target
+				clear(response.Payload)
+				response.Payload["error"] = "could not publish to server"
+				response.Payload["server_addr"] = serverAddr
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+				if b.debug {
+					b.debugLog("[HandleWS] Failed to send message to server %s", serverAddr)
+				}
+			}
+		case "publishToServer":
+			// Handle incoming server message
+			if data, ok := msg.Payload["data"].(map[string]any); ok {
+				if b.onServerData != nil {
+					b.onServerData(data)
+				}
+				// Send acknowledgment back
+				response := b.messagePool.Get()
+				response.Type = "published"
+				response.ID = msg.ID
+				clear(response.Payload)
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			} else {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = "invalid data format in server message"
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			}
+		case "has_subscribers":
+			// Check if topic has subscribers
+			hasSubscribers := b.bus.HasSubscribers(msg.Topic)
+			response := b.messagePool.Get()
+			response.Type = "subscribers_status"
+			response.Topic = msg.Topic
+			response.ID = msg.ID
+			clear(response.Payload)
+			response.Payload["has_subscribers"] = hasSubscribers
+			conn.WriteJSON(response)
+			b.messagePool.Put(response)
+		case "create_state_pool":
+			if err := b.handleStatePoolCreation(msg, conn); err != nil {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = err.Error()
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+				if b.debug {
+					b.debugLog("[HandleWS] Failed to create pool: %v", err)
+				}
+			} else {
+
+				if b.debug {
+					b.debugLog("[HandleWS] Successfully created pool")
+				}
+			}
+		case "create_actor_pool":
+			if err := b.handleActorPoolCreation(msg, conn); err != nil {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = err.Error()
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+				if b.debug {
+					b.debugLog("[HandleWS] Failed to create actor pool: %v", err)
+				}
+			} else {
+				if b.debug {
+					b.debugLog("[HandleWS] Successfully created actor pool")
+				}
+			}
+		case "actor_pool_message", "stop_actor_pool", "remove_actor_pool":
+			if err := b.handleActorPoolMessage(msg, conn); err != nil {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = err.Error()
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+			} else {
+				if b.debug {
+					b.debugLog("[HandleWS] got event %s", msg.Type)
+				}
+
+			}
+		case "state_pool_message", "state_pool_state", "update_state_pool",
+			"delete_state_pool_keys", "clear_state_pool", "save_state_pool",
+			"load_state_pool", "stop_state_pool", "remove_state_pool":
+			if err := b.handleStatePoolMessage(msg, conn); err != nil {
+				response := b.messagePool.Get()
+				response.Type = "error"
+				response.ID = msg.ID
+				clear(response.Payload)
+				response.Payload["error"] = err.Error()
+				conn.WriteJSON(response)
+				b.messagePool.Put(response)
+
+			}
+		default:
+			if b.debug {
+				b.debugLog("[HandleWS] Unknown message type from client %p: %s", conn, msg.Type)
+			}
+		}
+	}
+}
+
+// publishMessage represents a message to be published
+type publishMessage struct {
+	msg  *WSMessage
+	conn *wspool.Conn
+}
+
+// Implement Message interface for publishMessage
+func (m *publishMessage) GetData() any {
+	return m.msg
+}
+
+// MessagePool manages a pool of WSMessage objects
+type MessagePool struct {
+	pool sync.Pool
+}
+
+func NewMessagePool() *MessagePool {
+	return &MessagePool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &WSMessage{
+					Payload: make(map[string]any),
+				}
+			},
+		},
+	}
+}
+
+// Get gets a message from the pool
+func (p *MessagePool) Get() *WSMessage {
+	return p.pool.Get().(*WSMessage)
+}
+
+// Put returns a message to the pool
+func (p *MessagePool) Put(msg *WSMessage) {
+	msg.Type = ""
+	msg.Topic = ""
+	msg.ID = ""
+	msg.Target = ""
+	msg.MsgID = ""
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
+	}
+	p.pool.Put(msg)
+}
+
+// WSMessage implements Message interface
+func (m *WSMessage) GetData() any {
+	return m
+}
+
+// RemovePool removes and stops a stateful actor pool
+func (b *BusServer) RemovePool(poolName string) {
+	if pool, exists := b.pools.Get(poolName); exists {
+		pool.acpool.Stop()
+		b.pools.Delete(poolName)
+	}
 }
 
 // addPool adds a new stateful actor pool
@@ -120,16 +755,8 @@ func (b *BusServer) addPool(poolName string, pool *StatefulActorPool) error {
 	return nil
 }
 
-// RemovePool removes and stops a stateful actor pool
-func (b *BusServer) RemovePool(poolName string) {
-	if pool, exists := b.pools.Get(poolName); exists {
-		pool.acpool.Stop()
-		b.pools.Delete(poolName)
-	}
-}
-
 // Handle pool-related WebSocket messages
-func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error {
+func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *wspool.Conn) error {
 	switch msg.Type {
 	case "state_pool_message":
 		// Extract pool name from payload
@@ -152,27 +779,30 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 
 		if success {
 			// Send success response
-			response := WSMessage{
-				Type: "state_pool_message_sent",
-				ID:   msg.ID,
-				Payload: map[string]any{
-					"pool": poolName,
-				},
-			}
-			if err := conn.WriteJSON(response); err != nil {
+			response := b.messagePool.Get()
+			response.Type = "state_pool_message_sent"
+			response.ID = msg.ID
+			clear(response.Payload)
+			response.Payload["pool"] = poolName
+			err := conn.WriteJSON(response)
+			b.messagePool.Put(response)
+			if err != nil {
 				return err
 			}
 
 			// Send message to client handler
-			message := WSMessage{
-				Type: "state_pool_message",
-				ID:   msg.ID,
-				Payload: map[string]any{
-					"pool": poolName,
-					"data": msg.Payload["data"],
-				},
+			message := b.messagePool.Get()
+			message.Type = "state_pool_message"
+			message.ID = msg.ID
+			// Clear and reuse payload map
+			for k := range message.Payload {
+				delete(message.Payload, k)
 			}
-			return conn.WriteJSON(message)
+			message.Payload["pool"] = poolName
+			message.Payload["data"] = msg.Payload["data"]
+			err = conn.WriteJSON(message)
+			b.messagePool.Put(message)
+			return err
 		}
 		return errors.New("failed to send message to state pool")
 
@@ -196,15 +826,15 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 			return true
 		})
 
-		response := WSMessage{
-			Type: "state_pool_state",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool":  poolName,
-				"state": state,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_state"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		response.Payload["state"] = state
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "update_state_pool":
 		// Extract pool name and updates
@@ -229,14 +859,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 			pool.SetStateValue(key, value)
 		}
 
-		response := WSMessage{
-			Type: "state_pool_updated",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_updated"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "delete_state_pool_keys":
 		// Extract pool name and keys
@@ -263,14 +893,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 			}
 		}
 
-		response := WSMessage{
-			Type: "state_pool_keys_deleted",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_keys_deleted"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "clear_state_pool":
 		// Extract pool name
@@ -288,14 +918,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 		// Clear state
 		pool.ClearState()
 
-		response := WSMessage{
-			Type: "state_pool_cleared",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_cleared"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "save_state_pool":
 		// Extract pool name and directory
@@ -320,14 +950,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 			return fmt.Errorf("failed to save state: %w", err)
 		}
 
-		response := WSMessage{
-			Type: "state_pool_saved",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_saved"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "load_state_pool":
 		// Extract pool name and directory
@@ -352,14 +982,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 			return fmt.Errorf("failed to load state: %w", err)
 		}
 
-		response := WSMessage{
-			Type: "state_pool_loaded",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_loaded"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "stop_state_pool":
 		// Extract pool name
@@ -377,14 +1007,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 		// Stop the pool
 		pool.acpool.Stop()
 
-		response := WSMessage{
-			Type: "state_pool_stopped",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_stopped"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "remove_state_pool":
 		// Extract pool name
@@ -401,14 +1031,14 @@ func (b *BusServer) handleStatePoolMessage(msg *WSMessage, conn *SafeConn) error
 		// Remove the pool
 		b.RemovePool(poolName)
 
-		response := WSMessage{
-			Type: "state_pool_removed",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "state_pool_removed"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	default:
 		return nil // Not a pool message, continue normal processing
@@ -464,31 +1094,43 @@ func (b *BusServer) CreateActorPool(name string, size int, handler func([]Messag
 	return pool, nil
 }
 
-func (b *BusServer) handleActorPoolCreation(msg *WSMessage, conn *SafeConn) error {
-	b.debugLog("Handling actor pool creation request")
+func (b *BusServer) handleActorPoolCreation(msg *WSMessage, conn *wspool.Conn) error {
+	if b.debug {
+		b.debugLog("[handleActorPoolCreation] Handling actor pool creation request")
+	}
 	config, ok := msg.Payload["config"].(map[string]any)
 	if !ok {
-		b.debugLog("Invalid pool configuration: %v", msg.Payload)
+		if b.debug {
+			b.debugLog("[handleActorPoolCreation] Invalid pool configuration: %v", msg.Payload)
+		}
 		return fmt.Errorf("invalid pool configuration")
 	}
 
 	// Extract pool configuration
 	name, ok := config["name"].(string)
 	if !ok {
-		b.debugLog("Pool name is required but not found in config: %v", config)
+		if b.debug {
+			b.debugLog("[handleActorPoolCreation] Pool name is required but not found in config: %v", config)
+		}
 		return fmt.Errorf("pool name is required")
 	}
-	b.debugLog("Creating actor pool with name: %s", name)
+	if b.debug {
+		b.debugLog("[handleActorPoolCreation] Creating actor pool with name: %s", name)
+	}
 
 	size, ok := config["size"].(float64)
 	if !ok {
-		b.debugLog("Size not found in config, defaulting to 1")
+		if b.debug {
+			b.debugLog("[handleActorPoolCreation] Size not found in config, defaulting to 1")
+		}
 		size = 1
 	}
 
 	// Validate size
 	if size <= 0 {
-		b.debugLog("Invalid pool size: %v", size)
+		if b.debug {
+			b.debugLog("[handleActorPoolCreation] Invalid pool size: %v", size)
+		}
 		return fmt.Errorf("pool size must be greater than 0")
 	}
 
@@ -496,42 +1138,49 @@ func (b *BusServer) handleActorPoolCreation(msg *WSMessage, conn *SafeConn) erro
 	handler := func(msgs []Message) {
 		for _, msg := range msgs {
 			if poolMsg, ok := msg.(PoolMessage); ok {
-				response := WSMessage{
-					Type: "actor_pool_message",
-					ID:   poolMsg.ClientID,
-					Payload: map[string]any{
-						"pool": name,
-						"data": poolMsg.Data,
-					},
+				response := b.messagePool.Get()
+				response.Type = "actor_pool_message"
+				response.ID = poolMsg.ClientID
+				clear(response.Payload)
+				response.Payload["pool"] = name
+				response.Payload["data"] = poolMsg.Data
+				if b.debug {
+					b.debugLog("[handleActorPoolCreation][handlerfunc] Sending actor pool message response")
 				}
-				b.debugLog("Sending actor pool message response")
 				conn.WriteJSON(response)
+				b.messagePool.Put(response)
 			}
 		}
 	}
 
 	// Create the pool
-	b.debugLog("Creating actor pool with size: %d", int(size))
+	if b.debug {
+		b.debugLog("[handleActorPoolCreation] Creating actor pool with size: %d", int(size))
+	}
 	pool, err := b.CreateActorPool(name, int(size), handler)
 	if err != nil {
-		b.debugLog("Failed to create actor pool: %v", err)
+		if b.debug {
+			b.debugLog("[handleActorPoolCreation] Failed to create actor pool: %v", err)
+		}
 		return fmt.Errorf("failed to create pool: %w", err)
 	}
 
 	// Send success response
-	response := WSMessage{
-		Type: "actor_pool_created",
-		ID:   msg.ID,
-		Payload: map[string]any{
-			"pool": name,
-			"size": pool.Size(),
-		},
+	response := b.messagePool.Get()
+	response.Type = "actor_pool_created"
+	response.ID = msg.ID
+	clear(response.Payload)
+	response.Payload["pool"] = name
+	response.Payload["size"] = pool.Size()
+	if b.debug {
+		b.debugLog("[handleActorPoolCreation]  Sending success response for actor pool creation")
 	}
-	b.debugLog("Sending success response for actor pool creation")
-	return conn.WriteJSON(response)
+	err = conn.WriteJSON(response)
+	b.messagePool.Put(response)
+	return err
 }
 
-func (b *BusServer) handleActorPoolMessage(msg *WSMessage, conn *SafeConn) error {
+func (b *BusServer) handleActorPoolMessage(msg *WSMessage, conn *wspool.Conn) error {
 	switch msg.Type {
 	case "actor_pool_message":
 		// Extract pool name from payload
@@ -554,14 +1203,14 @@ func (b *BusServer) handleActorPoolMessage(msg *WSMessage, conn *SafeConn) error
 
 		if success {
 			// Send success response
-			response := WSMessage{
-				Type: "actor_pool_message_sent",
-				ID:   msg.ID,
-				Payload: map[string]any{
-					"pool": poolName,
-				},
-			}
-			return conn.WriteJSON(response)
+			response := b.messagePool.Get()
+			response.Type = "actor_pool_message_sent"
+			response.ID = msg.ID
+			clear(response.Payload)
+			response.Payload["pool"] = poolName
+			err := conn.WriteJSON(response)
+			b.messagePool.Put(response)
+			return err
 		}
 		return errors.New("failed to send message to actor pool")
 
@@ -581,14 +1230,14 @@ func (b *BusServer) handleActorPoolMessage(msg *WSMessage, conn *SafeConn) error
 		// Stop the pool
 		pool.Stop()
 
-		response := WSMessage{
-			Type: "actor_pool_stopped",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "actor_pool_stopped"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	case "remove_actor_pool":
 		// Extract pool name
@@ -605,22 +1254,24 @@ func (b *BusServer) handleActorPoolMessage(msg *WSMessage, conn *SafeConn) error
 		// Remove the pool
 		b.RemoveActorPool(poolName)
 
-		response := WSMessage{
-			Type: "actor_pool_removed",
-			ID:   msg.ID,
-			Payload: map[string]any{
-				"pool": poolName,
-			},
-		}
-		return conn.WriteJSON(response)
+		response := b.messagePool.Get()
+		response.Type = "actor_pool_removed"
+		response.ID = msg.ID
+		clear(response.Payload)
+		response.Payload["pool"] = poolName
+		err := conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return err
 
 	default:
 		return nil // Not an actor pool message, continue normal processing
 	}
 }
 
-func (b *BusServer) handleStatePoolCreation(msg *WSMessage, conn *SafeConn) error {
-	b.debugLog("Handling state pool creation request")
+func (b *BusServer) handleStatePoolCreation(msg *WSMessage, conn *wspool.Conn) error {
+	if b.debug {
+		b.debugLog("[handleStatePoolCreation] Handling state pool creation request")
+	}
 	config, ok := msg.Payload["config"].(map[string]any)
 	if !ok {
 		return fmt.Errorf("invalid pool configuration")
@@ -631,7 +1282,9 @@ func (b *BusServer) handleStatePoolCreation(msg *WSMessage, conn *SafeConn) erro
 	if !ok {
 		return fmt.Errorf("pool name is required")
 	}
-	b.debugLog("Creating state pool with name: %s", name)
+	if b.debug {
+		b.debugLog("[handleStatePoolCreation] Creating state pool with name: %s", name)
+	}
 
 	size, ok := config["size"].(float64)
 	if !ok {
@@ -659,7 +1312,9 @@ func (b *BusServer) handleStatePoolCreation(msg *WSMessage, conn *SafeConn) erro
 	}
 
 	// Create the pool
-	b.debugLog("Creating pool with config: %+v", poolConfig)
+	if b.debug {
+		b.debugLog("[handleStatePoolCreation] Creating pool with config: %+v", poolConfig)
+	}
 	pool, err := NewStatefulPool(name, poolConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create pool: %w", err)
@@ -669,474 +1324,22 @@ func (b *BusServer) handleStatePoolCreation(msg *WSMessage, conn *SafeConn) erro
 	if err := b.addPool(name, pool); err != nil {
 		return fmt.Errorf("failed to add pool: %w", err)
 	}
-	b.debugLog("Pool added successfully")
+	if b.debug {
+		b.debugLog("[handleStatePoolCreation] Pool added successfully")
+	}
 
 	// Send success response
-	response := WSMessage{
-		Type: "state_pool_created",
-		ID:   msg.ID,
-		Payload: map[string]any{
-			"pool": name,
-		},
+	response := b.messagePool.Get()
+	response.Type = "state_pool_created"
+	response.ID = msg.ID
+	clear(response.Payload)
+	response.Payload["pool"] = name
+	if b.debug {
+		b.debugLog("[handleStatePoolCreation] Sending success response")
 	}
-	b.debugLog("Sending success response")
-	return conn.WriteJSON(response)
-}
-
-func (b *BusServer) HandleWS(c *ksmux.Context) {
-	rawConn, err := c.UpgradeConnection()
-	if err != nil {
-		b.debugLog("WebSocket upgrade failed: %v", err)
-		c.Error(ErrUpgradeWs)
-		return
-	}
-
-	conn := &SafeConn{conn: rawConn}
-
-	var clientID string
-	// Ensure cleanup happens when the connection is closed
-	defer func() {
-		conn.Close()
-		// Clean up all subscriptions for this client
-		b.bus.CleanupConnection(rawConn)
-		b.debugLog("Cleaned up client %s", clientID)
-	}()
-
-	// Handle incoming messages
-	for {
-		messageType, message, err := conn.ReadMessage()
-		if err != nil {
-			if ws.IsCloseError(err, ws.CloseNormalClosure, ws.CloseGoingAway) {
-				b.debugLog("Client closed connection normally")
-			} else if !ws.IsUnexpectedCloseError(err, ws.CloseNormalClosure, ws.CloseGoingAway) {
-				b.debugLog("WebSocket error %v", err)
-			}
-			return
-		}
-
-		// Handle close messages
-		if messageType == ws.CloseMessage {
-			b.debugLog("Received close message from client %p", conn)
-			return
-		}
-
-		var msg WSMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			b.debugLog("Invalid message format from client %p: %v", conn, err)
-			continue
-		}
-
-		// Store client ID for cleanup
-		if msg.ID != "" {
-			clientID = msg.ID
-		}
-
-		b.debugLog("Received message: type=%s, id=%s",
-			msg.Type, msg.ID)
-
-		// Handle messages
-		switch msg.Type {
-		case "create_state_pool":
-			if err := b.handleStatePoolCreation(&msg, conn); err != nil {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": err.Error(),
-					},
-				}
-				conn.WriteJSON(response)
-				b.debugLog("Failed to create pool: %v", err)
-			} else {
-				b.debugLog("Successfully created pool")
-			}
-		case "create_actor_pool":
-			if err := b.handleActorPoolCreation(&msg, conn); err != nil {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": err.Error(),
-					},
-				}
-				conn.WriteJSON(response)
-				b.debugLog("Failed to create actor pool: %v", err)
-			} else {
-				b.debugLog("Successfully created actor pool")
-			}
-		case "actor_pool_message", "stop_actor_pool", "remove_actor_pool":
-			if err := b.handleActorPoolMessage(&msg, conn); err != nil {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": err.Error(),
-					},
-				}
-				conn.WriteJSON(response)
-			}
-		case "state_pool_message", "state_pool_state", "update_state_pool",
-			"delete_state_pool_keys", "clear_state_pool", "save_state_pool",
-			"load_state_pool", "stop_state_pool", "remove_state_pool":
-			if err := b.handleStatePoolMessage(&msg, conn); err != nil {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": err.Error(),
-					},
-				}
-				conn.WriteJSON(response)
-			}
-
-		case "subscribe":
-			// Subscribe to topic
-			sub := b.bus.Subscribe(msg.Topic, msg.Target, func(payload map[string]any, sub Subscription) {
-				response := WSMessage{
-					Type:    "message",
-					Topic:   msg.Topic,
-					Target:  msg.Target,
-					ID:      msg.ID,
-					Payload: payload,
-				}
-				conn.WriteJSON(response)
-			})
-
-			if sub == nil {
-				response := WSMessage{
-					Type:   "error",
-					ID:     msg.ID,
-					Topic:  msg.Topic,
-					Target: msg.Target,
-					Payload: map[string]any{
-						"error": "failed to subscribe",
-					},
-				}
-				conn.WriteJSON(response)
-				break
-			}
-
-			response := WSMessage{
-				Type:  "subscribed",
-				Topic: msg.Topic,
-				ID:    msg.ID,
-				Payload: map[string]any{
-					"subID": msg.Target,
-				},
-			}
-			conn.WriteJSON(response)
-
-		case "unsubscribe":
-			// Extract subscription ID from payload or use message ID
-			subID := msg.ID
-			if sid, ok := msg.Payload["subID"].(string); ok && sid != "" {
-				subID = sid
-			}
-
-			// Get subscription and unsubscribe
-			if sub := b.bus.Subscribe(msg.Topic, subID, nil); sub != nil {
-				sub.Unsubscribe()
-				response := WSMessage{
-					Type:  "unsubscribed",
-					Topic: msg.Topic,
-					ID:    msg.ID,
-					Payload: map[string]any{
-						"subID": subID,
-					},
-				}
-				conn.WriteJSON(response)
-			} else {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": "unsubscribe failed: subscription not found",
-					},
-				}
-				conn.WriteJSON(response)
-			}
-
-		case "publish":
-			// Handle publish
-			success := b.bus.Publish(msg.Topic, msg.Payload, &PublishOptions{
-				OnSuccess: func() {
-					response := WSMessage{
-						Type:  "published",
-						Topic: msg.Topic,
-						ID:    msg.ID,
-					}
-					conn.WriteJSON(response)
-				},
-				OnFailure: func(err error) {
-					response := WSMessage{
-						Type: "error",
-						ID:   msg.ID,
-						Payload: map[string]any{
-							"error": err.Error(),
-						},
-					}
-					conn.WriteJSON(response)
-				},
-			})
-			if !success {
-				b.debugLog("Failed to publish message to topic %s", msg.Topic)
-				// Send error response if no subscribers
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": "no subscribers found",
-					},
-				}
-				conn.WriteJSON(response)
-			}
-
-		case "publishTo":
-			// Handle direct publish
-			success := b.bus.PublishTo(msg.Topic, msg.Target, msg.Payload, &PublishOptions{
-				OnSuccess: func() {
-					response := WSMessage{
-						Type:   "published",
-						Topic:  msg.Topic,
-						ID:     msg.ID,
-						Target: msg.Target,
-					}
-					conn.WriteJSON(response)
-				},
-				OnFailure: func(err error) {
-					response := WSMessage{
-						Type: "error",
-						ID:   msg.ID,
-						Payload: map[string]any{
-							"error": err.Error(),
-						},
-					}
-					conn.WriteJSON(response)
-				},
-			})
-			if !success {
-				b.debugLog("Failed to publish direct message to topic %s, target %s", msg.Topic, msg.Target)
-			}
-
-		case "publishWithRetry":
-			// Handle publish with retry
-			var cfg RetryConfig
-			if cfgData, ok := msg.Payload["retry_config"].(map[string]any); ok {
-				if maxAttempts, ok := cfgData["max_attempts"].(float64); ok {
-					cfg.MaxAttempts = int(maxAttempts)
-				}
-				if maxBackoff, ok := cfgData["max_backoff"].(float64); ok {
-					cfg.MaxBackoff = int(maxBackoff)
-				}
-			}
-			if cfg.MaxAttempts == 0 {
-				cfg = DefaultRetryConfig
-			}
-
-			dmap, ok := msg.Payload["data"].(map[string]any)
-			if !ok {
-				dmap = map[string]any{
-					"data": msg.Payload["data"],
-				}
-			}
-
-			success := b.bus.PublishWithRetry(msg.Topic, dmap, &cfg, &PublishOptions{
-				OnSuccess: func() {
-					response := WSMessage{
-						Type:   "published",
-						Topic:  msg.Topic,
-						Target: msg.Target,
-						ID:     msg.ID,
-					}
-					conn.WriteJSON(response)
-				},
-				OnFailure: func(err error) {
-					response := WSMessage{
-						Type:   "error",
-						ID:     msg.ID,
-						Topic:  msg.Topic,
-						Target: msg.Target,
-						Payload: map[string]any{
-							"error": err.Error(),
-						},
-					}
-					conn.WriteJSON(response)
-				},
-			})
-			if !success {
-				b.debugLog("Failed to publish message with retry to topic %s", msg.Topic)
-			}
-
-		case "publishToWithRetry":
-			// Handle publishTo with retry
-			var cfg RetryConfig
-			if cfgData, ok := msg.Payload["retry_config"].(map[string]any); ok {
-				if maxAttempts, ok := cfgData["max_attempts"].(float64); ok {
-					cfg.MaxAttempts = int(maxAttempts)
-				}
-				if maxBackoff, ok := cfgData["max_backoff"].(float64); ok {
-					cfg.MaxBackoff = int(maxBackoff)
-				}
-			}
-			if cfg.MaxAttempts == 0 {
-				cfg = DefaultRetryConfig
-			}
-
-			if msg.Target == "" {
-				response := WSMessage{
-					Type:   "error",
-					ID:     msg.ID,
-					Topic:  msg.Topic,
-					Target: msg.Target,
-					Payload: map[string]any{
-						"error": "target field is required for publishTo",
-					},
-				}
-				conn.WriteJSON(response)
-				break
-			}
-			dmap, ok := msg.Payload["data"].(map[string]any)
-			if !ok {
-				dmap = map[string]any{
-					"data": msg.Payload["data"],
-				}
-			}
-			success := b.bus.PublishToWithRetry(msg.Topic, msg.Target, dmap, &cfg, &PublishOptions{
-				OnSuccess: func() {
-					response := WSMessage{
-						Type:   "published",
-						Topic:  msg.Topic,
-						Target: msg.Target,
-						ID:     msg.ID,
-					}
-					conn.WriteJSON(response)
-				},
-				OnFailure: func(err error) {
-					response := WSMessage{
-						Type:   "error",
-						ID:     msg.ID,
-						Topic:  msg.Topic,
-						Target: msg.Target,
-						Payload: map[string]any{
-							"error": err.Error(),
-						},
-					}
-					conn.WriteJSON(response)
-				},
-			})
-			if !success {
-				b.debugLog("Failed to publish direct message with retry to topic %s, target %s", msg.Topic, msg.Target)
-			}
-
-		case "send_to_server":
-			// Handle sending message to another server
-			serverAddr, ok := msg.Payload["server_addr"].(string)
-			if !ok {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": "missing or invalid server_addr",
-					},
-				}
-				conn.WriteJSON(response)
-				b.debugLog("Invalid server_addr in send_to_server message")
-				continue
-			}
-
-			data, ok := msg.Payload["data"].(map[string]any)
-			if !ok {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": "missing or invalid data",
-					},
-				}
-				conn.WriteJSON(response)
-				b.debugLog("Invalid data in send_to_server message")
-				continue
-			}
-
-			// Get custom path if provided
-			var path []string
-			if customPath, ok := msg.Payload["path"].(string); ok {
-				path = []string{customPath}
-			}
-
-			// Send message to other server
-			success := b.PublishToServer(serverAddr, data, &PublishOptions{
-				OnSuccess: func() {
-					response := WSMessage{
-						Type: "published",
-						ID:   msg.ID,
-						Payload: map[string]any{
-							"server_addr": serverAddr,
-						},
-					}
-					conn.WriteJSON(response)
-				},
-				OnFailure: func(err error) {
-					response := WSMessage{
-						Type: "error",
-						ID:   msg.ID,
-						Payload: map[string]any{
-							"error":       err.Error(),
-							"server_addr": serverAddr,
-						},
-					}
-					conn.WriteJSON(response)
-				},
-			}, path...)
-
-			if !success {
-				b.debugLog("Failed to send message to server %s", serverAddr)
-			}
-
-		case "publishToServer":
-			// Handle incoming server message
-			if data, ok := msg.Payload["data"].(map[string]any); ok {
-				if b.onServerData != nil {
-					b.onServerData(data)
-				}
-				// Send acknowledgment back
-				response := WSMessage{
-					Type: "published",
-					ID:   msg.ID,
-				}
-				if err := conn.WriteJSON(response); err != nil {
-					b.debugLog("Failed to send server message acknowledgment: %v", err)
-				}
-			} else {
-				response := WSMessage{
-					Type: "error",
-					ID:   msg.ID,
-					Payload: map[string]any{
-						"error": "invalid data format in server message",
-					},
-				}
-				conn.WriteJSON(response)
-			}
-
-		case "has_subscribers":
-			// Check if topic has subscribers
-			hasSubscribers := b.bus.HasSubscribers(msg.Topic)
-			response := WSMessage{
-				Type:  "subscribers_status",
-				Topic: msg.Topic,
-				ID:    msg.ID,
-				Payload: map[string]any{
-					"has_subscribers": hasSubscribers,
-				},
-			}
-			if err := conn.WriteJSON(response); err != nil {
-				b.debugLog("Failed to send subscribers status: %v", err)
-			}
-
-		default:
-			b.debugLog("Unknown message type from client %p: %s", conn, msg.Type)
-		}
-	}
+	err = conn.WriteJSON(response)
+	b.messagePool.Put(response)
+	return err
 }
 
 func (b *BusServer) WithCustomPath(path string) *BusServer {
@@ -1174,8 +1377,10 @@ func (b *BusServer) RunAutoTLS() {
 
 // PublishToServer sends a message to another BusServer
 func (b *BusServer) PublishToServer(serverAddr string, msg map[string]any, opts *PublishOptions, path ...string) bool {
-	b.debugLog("=== PUBLISH TO SERVER START ===")
-	b.debugLog("Publishing to server %s", serverAddr)
+	if b.debug {
+		b.debugLog("=== PUBLISH TO SERVER START ===")
+		b.debugLog("Publishing to server %s", serverAddr)
+	}
 
 	// Get or create client connection to target server
 	client, exists := b.busServersConns.Get(serverAddr)
@@ -1193,7 +1398,9 @@ func (b *BusServer) PublishToServer(serverAddr string, msg map[string]any, opts 
 			}(),
 		})
 		if err != nil {
-			b.debugLog("Failed to create client connection: %v", err)
+			if b.debug {
+				b.debugLog("Failed to create client connection: %v", err)
+			}
 			if opts != nil && opts.OnFailure != nil {
 				opts.OnFailure(fmt.Errorf("failed to connect to server %s: %w", serverAddr, err))
 			}
@@ -1205,12 +1412,16 @@ func (b *BusServer) PublishToServer(serverAddr string, msg map[string]any, opts 
 	// Send message to target server
 	success := client.PublishToServer(serverAddr, msg, opts)
 	if !success {
-		b.debugLog("Failed to publish message to server %s", serverAddr)
+		if b.debug {
+			b.debugLog("Failed to publish message to server %s", serverAddr)
+		}
 		return false
 	}
 
-	b.debugLog("Successfully published message to server %s", serverAddr)
-	b.debugLog("=== PUBLISH TO SERVER END ===")
+	if b.debug {
+		b.debugLog("Successfully published message to server %s", serverAddr)
+		b.debugLog("=== PUBLISH TO SERVER END ===")
+	}
 	return true
 }
 
@@ -1234,7 +1445,6 @@ func (b *BusServer) Stop() {
 			b.app.Stop()
 		}
 	}
-
 }
 
 // OnServerData triggered when this server receive data from another server
@@ -1249,7 +1459,65 @@ func (b *BusServer) WithDebug(enabled bool) *BusServer {
 	return b
 }
 
-// Update the LowAllocPubSub interface to use SafeConn
-func (b *BusServer) CleanupConnection(conn *SafeConn) {
-	b.bus.CleanupConnection(conn.conn)
+// Update the LowAllocPubSub interface to use wspool.Conn
+func (b *BusServer) CleanupConnection(conn *wspool.Conn) {
+	b.bus.CleanupConnection(conn)
+}
+
+func (b *BusServer) handleSubscribe(ctx *MessageContext) {
+	// Subscribe to topic
+	sub := b.bus.Subscribe(ctx.msg.Topic, ctx.msg.Target, func(payload map[string]any, sub Subscription) {
+		response := b.messagePool.Get()
+		response.Type = "message"
+		response.Topic = ctx.msg.Topic
+		response.Target = ctx.msg.Target
+		response.ID = ctx.msg.ID
+		// Copy payload data
+		for k, v := range payload {
+			response.Payload[k] = v
+		}
+		// Send response and return to pool
+		ctx.conn.WriteJSON(response)
+		b.messagePool.Put(response)
+	})
+
+	if sub == nil {
+		response := b.messagePool.Get()
+		response.Type = "error"
+		response.ID = ctx.msg.ID
+		response.Topic = ctx.msg.Topic
+		response.Target = ctx.msg.Target
+		response.Payload["error"] = "failed to subscribe"
+		ctx.conn.WriteJSON(response)
+		b.messagePool.Put(response)
+		return
+	}
+
+	// Send immediate subscription confirmation
+	response := b.messagePool.Get()
+	response.Type = "subscribed"
+	response.Topic = ctx.msg.Topic
+	response.ID = ctx.msg.ID
+	response.Target = ctx.msg.Target
+	response.Payload["subID"] = ctx.msg.Target
+	// Send synchronously to ensure subscription is confirmed before any publishes
+	ctx.conn.WriteJSON(response)
+	b.messagePool.Put(response)
+}
+
+func (b *BusServer) handlePoolMessage(ctx *MessageContext) {
+	switch ctx.msg.Type {
+	case "actor_pool_message":
+		if err := b.handleActorPoolMessage(ctx.msg, ctx.conn); err != nil {
+			if b.debug {
+				b.debugLog("Error handling actor pool message: %v", err)
+			}
+		}
+	case "state_pool_message":
+		if err := b.handleStatePoolMessage(ctx.msg, ctx.conn); err != nil {
+			if b.debug {
+				b.debugLog("Error handling state pool message: %v", err)
+			}
+		}
+	}
 }

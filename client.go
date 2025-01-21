@@ -87,26 +87,27 @@ func main() {
 */
 
 import (
-	"encoding/json"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/kamalshkeir/kmap"
 	"github.com/kamalshkeir/ksmux"
 	"github.com/kamalshkeir/ksmux/ws"
+	"github.com/kamalshkeir/ksmux/wspool"
 )
 
 // Client represents a WebSocket client
 type Client struct {
 	config      ClientConfig
-	conn        *ws.Conn
-	mu          sync.RWMutex
+	conn        *wspool.Conn
 	isConnected bool
 	retryCount  int
 	handlers    *kmap.SafeMap[string, func(map[string]any, Subscription)]
 	pending     *kmap.SafeMap[string, chan *WSMessage]
+	// Message pool for better memory reuse
+	msgPool sync.Pool
+	debug   bool
 }
 
 // ClientConfig holds the configuration for the WebSocket client
@@ -139,12 +140,32 @@ func NewClient(config ClientConfig) (*Client, error) {
 		pending:  kmap.New[string, chan *WSMessage](10),
 	}
 
-	err := client.connect()
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
+	// Initialize message pool
+	client.msgPool.New = func() interface{} {
+		return &WSMessage{
+			Payload: make(map[string]any),
+		}
 	}
 
+	if client.debug {
+		client.debugTitle("Connecting...")
+	}
+	err := client.connect()
+	if err != nil {
+		if client.debug {
+			client.debugLog("failed to connect %w", err)
+		}
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+	if client.debug {
+		client.debugLog("Connected as %s to %s%s", client.config.ClientID, config.Address, config.Path)
+		client.debugLines()
+	}
 	return client, nil
+}
+
+func (c *Client) WithDebug(debug bool) {
+	c.debug = debug
 }
 
 func (c *Client) connect() error {
@@ -153,17 +174,18 @@ func (c *Client) connect() error {
 		protocol = "wss"
 	}
 	url := fmt.Sprintf("%s://%s%s", protocol, c.config.Address, c.config.Path)
-
+	if c.debug {
+		c.debugLog("connecting to %s", url)
+	}
 	conn, _, err := ws.DefaultDialer.Dial(url, nil)
 	if err != nil {
 		return err
 	}
+	cn := wspool.DefaultPool().AddClient(conn, c.config.Address)
 
-	c.mu.Lock()
-	c.conn = conn
+	c.conn = cn
 	c.isConnected = true
 	c.retryCount = 0
-	c.mu.Unlock()
 
 	// Start message handler
 	go c.handleMessages()
@@ -171,10 +193,34 @@ func (c *Client) connect() error {
 	return nil
 }
 
+func (c *Client) debugLog(format string, args ...interface{}) {
+	if c.debug {
+		fmt.Printf("[CLIENT DEBUG] "+format+"\n", args...)
+	}
+}
+
+func (c *Client) debugTitle(format string, args ...interface{}) {
+	if c.debug {
+		fmt.Printf("---------- "+format+" ----------\n", args...)
+	}
+}
+
+func (c *Client) debugLines() {
+	if c.debug {
+		fmt.Println("-------------------------------")
+	}
+}
+
 func (c *Client) handleMessages() {
 	for {
-		_, message, err := c.conn.ReadMessage()
+		msg := c.getWSMessage()
+		msg.reset()
+		defer c.putWSMessage(msg)
+		err := c.conn.ReadJSON(&msg)
 		if err != nil {
+			if c.debug {
+				c.debugLog("[handleMessages] closing the connection")
+			}
 			if ws.IsCloseError(err, ws.CloseNormalClosure, ws.CloseGoingAway) {
 				break
 			}
@@ -183,63 +229,107 @@ func (c *Client) handleMessages() {
 			}
 			break
 		}
-
-		var msg WSMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("Failed to unmarshal message: %v", err)
-			continue
+		if c.debug {
+			c.debugLog("[handleMessages] got msg type='%s', topic='%s', target='%s' id='%s'", msg.Type, msg.Topic, msg.Target, msg.ID)
 		}
-
 		switch msg.Type {
 		case "message":
-			if handler, ok := c.handlers.GetAny(msg.Topic+"-"+msg.Target, msg.Topic); ok {
-				subID := msg.ID
-				if sid, ok := msg.Payload["subID"].(string); ok && sid != "" {
-					subID = sid
+			if c.debug {
+				c.debugTitle("'%s'", msg.Type)
+			}
+			handlerKey := msg.Topic + "-" + msg.Target
+			if handler, ok := c.handlers.GetAny(handlerKey, msg.Topic); ok {
+				if c.debug {
+					c.debugLog("[handleMessages](%s) handler found for key='%s', topic='%s'", msg.Type, handlerKey, msg.Topic)
 				}
 				handler(msg.Payload, &clientSubscription{
 					topic:  msg.Topic,
-					subID:  subID,
+					subID:  msg.Target,
 					client: c,
 				})
+			} else if c.debug {
+				c.debugLog("[handleMessages](%s) handler not found for key='%s', topic='%s'", msg.Type, handlerKey, msg.Topic)
 			}
+			c.putWSMessage(msg)
 		case "state_pool_message":
+			if c.debug {
+				c.debugTitle("'%s'", msg.Type)
+			}
 			if poolName, ok := msg.Payload["pool"].(string); ok {
-				handlerID := fmt.Sprintf("state_pool_%s", poolName)
-				if handler, ok := c.handlers.Get(handlerID); ok {
+				handlerKey := fmt.Sprintf("state_pool_%s", poolName)
+				if handler, ok := c.handlers.Get(handlerKey); ok {
+					if c.debug {
+						c.debugLog("[handleMessages](%s) handler found for key='%s', topic='%s'", msg.Type, handlerKey, msg.Topic)
+					}
 					handler(msg.Payload, &clientSubscription{
-						topic:  handlerID,
+						topic:  handlerKey,
 						subID:  msg.ID,
 						client: c,
 					})
+				} else {
+					if c.debug {
+						c.debugLog("[handleMessages](%s) handler not found for key='%s', topic='%s'", msg.Type, handlerKey, msg.Topic)
+					}
+				}
+			} else {
+				if c.debug {
+					c.debugLog("[handleMessages](%s) missing 'pool' in payload %+v", msg.Type, msg.Payload)
 				}
 			}
+			c.putWSMessage(msg)
 		case "error", "published", "subscribed", "unsubscribed", "subscribers_status",
 			"state_pool_created", "state_pool_message_sent", "state_pool_updated",
 			"state_pool_keys_deleted", "state_pool_cleared", "state_pool_saved",
 			"state_pool_loaded", "state_pool_stopped", "state_pool_removed",
 			"state_pool_state", "actor_pool_created", "actor_pool_message_sent",
 			"actor_pool_stopped", "actor_pool_removed":
+			if c.debug {
+				c.debugTitle("'%s'", msg.Type)
+				c.debugLog("[handleMessages](%s) GOT msg_id='%s', topic='%s', target='%s'", msg.Type, msg.ID, msg.Topic, msg.Target)
+			}
 			if ch, ok := c.pending.Get(msg.ID); ok {
+				if c.debug {
+					c.debugLog("channel found")
+				}
 				select {
-				case ch <- &msg:
-					// Message sent successfully
+				case ch <- msg:
+					if c.debug {
+						c.debugLog("channel %s sent", msg.ID)
+					}
+					// Message will be put back by the receiver
 				default:
 					// Channel is closed or full, clean up
-					c.pending.Delete(msg.ID)
+					if c.debug {
+						c.debugLog("channel is closed or full, deleting pending %s", msg.ID)
+					}
+					c.putWSMessage(msg)
 				}
+			} else {
+				if c.debug {
+					c.debugLog("channel not found")
+				}
+				c.putWSMessage(msg)
 			}
 		case "actor_pool_message":
+			if c.debug {
+				c.debugTitle("'%s'", msg.Type)
+			}
 			if poolName, ok := msg.Payload["pool"].(string); ok {
-				handlerID := fmt.Sprintf("actor_pool_%s", poolName)
-				if handler, ok := c.handlers.Get(handlerID); ok {
+				handlerKey := fmt.Sprintf("actor_pool_%s", poolName)
+				if handler, ok := c.handlers.Get(handlerKey); ok {
 					handler(msg.Payload, &clientSubscription{
-						topic:  handlerID,
+						topic:  handlerKey,
 						subID:  msg.ID,
 						client: c,
 					})
 				}
 			}
+			c.putWSMessage(msg)
+		default:
+			if c.debug {
+				c.debugLog("hit default case for type='%s', topic='%s', target='%s' id='%s'", msg.Type, msg.Topic, msg.Target, msg.ID)
+			}
+			c.putWSMessage(msg)
 		}
 	}
 }
@@ -251,7 +341,13 @@ func (c *Client) reconnect() {
 	}
 	time.Sleep(backoff)
 	c.retryCount++
+	if c.debug {
+		c.debugLog("Reconnecting")
+	}
 	c.connect()
+	if c.debug {
+		c.debugLog("Connected")
+	}
 }
 
 func (c *Client) generateMessageID(topic, subID string) string {
@@ -267,19 +363,42 @@ func (c *Client) generateMessageID(topic, subID string) string {
 
 func (c *Client) waitForResponse(messageID string, timeout time.Duration) (*WSMessage, error) {
 	// Get the response channel
+	if c.debug {
+		c.debugTitle("'waitForResponse'")
+	}
 	respChan, ok := c.pending.Get(messageID)
-	if !ok {
+	if !ok && c.debug {
+		c.debugLog("no response channel for message %s", messageID)
 		return nil, fmt.Errorf("no response channel for message %s", messageID)
 	}
-
 	// Wait for response with timeout
+	if c.debug {
+		c.debugLog("waiting for response for %s", messageID)
+	}
 	select {
 	case resp := <-respChan:
+		if c.debug {
+			c.debugLog("got response, deleting pending, and closing channel")
+		}
 		if resp == nil {
+			c.pending.Delete(messageID)
+			close(respChan)
 			return nil, fmt.Errorf("response channel closed without response")
+		}
+		// Only clean up after we know we have a valid response
+		c.pending.Delete(messageID)
+		close(respChan)
+		if c.debug {
+			c.debugLog("done waiting")
 		}
 		return resp, nil
 	case <-time.After(timeout):
+		// Clean up on timeout
+		c.pending.Delete(messageID)
+		close(respChan)
+		if c.debug {
+			c.debugLog("done waiting without response after %v", timeout)
+		}
 		return nil, fmt.Errorf("response timeout after %v", timeout)
 	}
 }
@@ -289,32 +408,57 @@ func (c *Client) Subscribe(topic string, subID string, handler func(map[string]a
 	if subID == "" {
 		subID = c.config.ClientID
 	}
-	messageID := ksmux.GenerateID()
-	message := WSMessage{
-		Type:   "subscribe",
-		Topic:  topic,
-		ID:     messageID,
-		Target: subID,
-	}
+	messageID := "sub-" + ksmux.GenerateID()
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "subscribe"
+	msg.Topic = topic
+	msg.Target = subID
+	msg.ID = messageID
 
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
 
-	err := c.conn.WriteJSON(message)
+	if c.debug {
+		c.debugTitle("Subscribing...")
+		c.debugLog("subscribing to topic=%s, subID=%s, msgID=%s", msg.Topic, msg.Target, msg.ID)
+	}
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
+		if c.debug {
+			c.debugLog("failed to send subscription %+v %w", msg, err)
+		}
 		c.pending.Delete(messageID)
+		close(respChan)
 		return nil
 	}
 
 	// Wait for response
+	if c.debug {
+		c.debugLog("start waiting for sub response")
+	}
 	resp, err := c.waitForResponse(messageID, 5*time.Second)
 	if err != nil || resp.Type != "subscribed" {
-		c.pending.Delete(messageID)
+		if resp != nil {
+			c.debugLog("no response ^^")
+			c.putWSMessage(resp)
+		}
 		return nil
 	}
+	if c.debug {
+		c.debugLog("finish waiting response")
+	}
+	defer c.putWSMessage(resp)
 
-	c.handlers.Set(topic+"-"+subID, handler)
+	// Store handler with consistent key format
+	handlerKey := topic + "-" + subID
+	if c.debug {
+		c.debugLog("storing the handler for topic='%s' subID='%s' with key='%s'", msg.Topic, msg.Target, handlerKey)
+	}
+	c.handlers.Set(handlerKey, handler)
+
 	return &clientSubscription{
 		topic:  topic,
 		subID:  subID,
@@ -325,58 +469,92 @@ func (c *Client) Subscribe(topic string, subID string, handler func(map[string]a
 // Publish publishes a message to a topic
 func (c *Client) Publish(topic string, payload map[string]any, opts *PublishOptions) bool {
 	messageID := "pub-" + ksmux.GenerateID()
-	message := WSMessage{
-		Type:    "publish",
-		Topic:   topic,
-		ID:      messageID,
-		Payload: payload,
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "publish"
+	msg.Topic = topic
+	msg.ID = messageID
+	for k, v := range payload {
+		msg.Payload[k] = v
+	}
+	if c.debug {
+		c.debugTitle("Publishing...")
+		c.debugLog("publishing to topic='%s' payload='%+v' opts='%+v'", topic, payload, opts)
+	}
+
+	if opts == nil {
+		if c.debug {
+			c.debugLog("no ack")
+		}
+		msg.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
 	}
 
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
-	defer func() {
-		// Clean up the channel
+
+	err := c.conn.WriteJSON(msg)
+	if err != nil {
 		c.pending.Delete(messageID)
 		close(respChan)
-	}()
-
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
-	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
 	}
 
 	// Wait for response
-	var success bool
-	select {
-	case resp := <-respChan:
-		success = resp != nil && resp.Type == "published"
-		if success {
-			if opts != nil && opts.OnSuccess != nil {
-				opts.OnSuccess()
+	if c.debug {
+		c.debugLog("start wait for %s", messageID)
+	}
+	resp, err := c.waitForResponse(messageID, 5*time.Second)
+	if err != nil {
+		if opts.OnFailure != nil {
+			opts.OnFailure(err)
+		}
+		return false
+	}
+	if c.debug {
+		c.debugLog("finish wait for %s", messageID)
+	}
+	success := resp != nil && resp.Type == "published"
+	if success {
+		if opts.OnSuccess != nil {
+			if c.debug {
+				c.debugLog("OnSuccess Publish case triggering fn")
 			}
-		} else if opts != nil && opts.OnFailure != nil {
-			if resp != nil && resp.Type == "error" {
-				if errMsg, ok := resp.Payload["error"].(string); ok {
-					opts.OnFailure(fmt.Errorf("%s", errMsg))
-				} else {
-					opts.OnFailure(fmt.Errorf("publish failed"))
+			opts.OnSuccess()
+		} else if c.debug {
+			c.debugLog("no handler OnSuccess")
+		}
+	} else if opts.OnFailure != nil {
+		if resp != nil && resp.Type == "error" {
+			if c.debug {
+				c.debugLog("OnFail Publish case triggering fn")
+			}
+			if errMsg, ok := resp.Payload["error"].(string); ok {
+				if c.debug {
+					c.debugLog("triggering OnFailure with err %s", errMsg)
 				}
+				opts.OnFailure(fmt.Errorf("%s", errMsg))
 			} else {
+				if c.debug {
+					c.debugLog("triggering OnFailure with default err pub fail")
+				}
 				opts.OnFailure(fmt.Errorf("publish failed"))
 			}
+		} else {
+			if c.debug {
+				c.debugLog("response is nil or resp.Type not error")
+			}
+			opts.OnFailure(fmt.Errorf("publish failed"))
 		}
-	case <-time.After(5 * time.Second):
-		if opts != nil && opts.OnFailure != nil {
-			opts.OnFailure(fmt.Errorf("publish timeout"))
-		}
-		success = false
 	}
 
+	c.putWSMessage(resp)
 	return success
 }
 
@@ -387,19 +565,26 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 	}
 
 	messageID := "pubretry-" + ksmux.GenerateID()
-	message := WSMessage{
-		Type:  "publishWithRetry",
-		Topic: topic,
-		ID:    messageID,
-		Payload: map[string]any{
-			"data": payload,
-			"retry_config": map[string]any{
-				"max_attempts": cfg.MaxAttempts,
-				"max_backoff":  cfg.MaxBackoff,
-			},
-		},
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "publishWithRetry"
+	msg.Topic = topic
+	msg.ID = messageID
+	msg.Payload["data"] = payload
+	msg.Payload["retry_config"] = map[string]any{
+		"max_attempts": cfg.MaxAttempts,
+		"max_backoff":  cfg.MaxBackoff,
 	}
 
+	if opts == nil {
+		if c.debug {
+			c.debugLog("PublishWithRetry: no ack %s", topic)
+		}
+		msg.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
+	}
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
@@ -409,10 +594,9 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 		close(respChan)
 	}()
 
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
@@ -424,10 +608,10 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 	case resp := <-respChan:
 		success = resp != nil && resp.Type == "published"
 		if success {
-			if opts != nil && opts.OnSuccess != nil {
+			if opts.OnSuccess != nil {
 				opts.OnSuccess()
 			}
-		} else if opts != nil && opts.OnFailure != nil {
+		} else if opts.OnFailure != nil {
 			if resp != nil && resp.Type == "error" {
 				if errMsg, ok := resp.Payload["error"].(string); ok {
 					opts.OnFailure(fmt.Errorf("%s", errMsg))
@@ -439,7 +623,7 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 			}
 		}
 	case <-time.After(5 * time.Second):
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(fmt.Errorf("publish timeout"))
 		}
 		success = false
@@ -451,12 +635,24 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 // PublishTo publishes a message to a specific client
 func (c *Client) PublishTo(topic, targetID string, payload map[string]any, opts *PublishOptions) bool {
 	messageID := "pubto-" + ksmux.GenerateID()
-	message := WSMessage{
-		Type:    "publishTo",
-		Topic:   topic,
-		Target:  targetID,
-		ID:      messageID,
-		Payload: payload,
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "publishTo"
+	msg.Topic = topic
+	msg.Target = targetID
+	msg.ID = messageID
+	for k, v := range payload {
+		msg.Payload[k] = v
+	}
+
+	if opts == nil {
+		if c.debug {
+			c.debugLog("PublishTo: no ack %s %s", topic, targetID)
+		}
+		msg.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
 	}
 
 	// Create response channel before sending
@@ -468,10 +664,9 @@ func (c *Client) PublishTo(topic, targetID string, payload map[string]any, opts 
 		close(respChan)
 	}()
 
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
@@ -483,10 +678,10 @@ func (c *Client) PublishTo(topic, targetID string, payload map[string]any, opts 
 	case resp := <-respChan:
 		success = resp != nil && resp.Type == "published"
 		if success {
-			if opts != nil && opts.OnSuccess != nil {
+			if opts.OnSuccess != nil {
 				opts.OnSuccess()
 			}
-		} else if opts != nil && opts.OnFailure != nil {
+		} else if opts.OnFailure != nil {
 			if resp != nil && resp.Type == "error" {
 				if errMsg, ok := resp.Payload["error"].(string); ok {
 					opts.OnFailure(fmt.Errorf("%s", errMsg))
@@ -498,7 +693,7 @@ func (c *Client) PublishTo(topic, targetID string, payload map[string]any, opts 
 			}
 		}
 	case <-time.After(5 * time.Second):
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(fmt.Errorf("publish timeout"))
 		}
 		success = false
@@ -514,20 +709,36 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 	}
 
 	messageID := "pubtoretry-" + ksmux.GenerateID()
-	message := WSMessage{
-		Type:   "publishToWithRetry",
-		Topic:  topic,
-		ID:     messageID,
-		Target: targetID,
-		Payload: map[string]any{
-			"data": payload,
-			"retry_config": map[string]any{
-				"max_attempts": cfg.MaxAttempts,
-				"max_backoff":  cfg.MaxBackoff,
-			},
-		},
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "publishToWithRetry"
+	msg.Topic = topic
+	msg.ID = messageID
+	msg.Target = targetID
+	msg.Payload["data"] = payload
+	msg.Payload["retry_config"] = map[string]any{
+		"max_attempts": cfg.MaxAttempts,
+		"max_backoff":  cfg.MaxBackoff,
+	}
+	if c.debug {
+		c.debugTitle("PublishToWithRetry...")
+		c.debugLog("pub with retry topic='%s', target='%s', msgID='%s', payload='%+v'", msg.Topic, msg.Payload, cfg, msg.ID)
+	}
+	if opts == nil {
+		if c.debug {
+			c.debugLog("PublishToWithRetry: no ack %s %s", topic, targetID)
+		}
+		msg.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
 	}
 
+	// Check for no_ack in payload
+	if na, ok := payload["no_ack"].(bool); ok && na {
+		err := c.conn.WriteJSON(msg)
+		return err == nil
+	}
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
@@ -537,10 +748,9 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 		close(respChan)
 	}()
 
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
@@ -552,10 +762,10 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 	case resp := <-respChan:
 		success = resp != nil && resp.Type == "published"
 		if success {
-			if opts != nil && opts.OnSuccess != nil {
+			if opts.OnSuccess != nil {
 				opts.OnSuccess()
 			}
-		} else if opts != nil && opts.OnFailure != nil {
+		} else if opts.OnFailure != nil {
 			if resp != nil && resp.Type == "error" {
 				if errMsg, ok := resp.Payload["error"].(string); ok {
 					opts.OnFailure(fmt.Errorf("%s", errMsg))
@@ -567,7 +777,7 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 			}
 		}
 	case <-time.After(5 * time.Second):
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(fmt.Errorf("publish timeout"))
 		}
 		success = false
@@ -579,19 +789,19 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 // HasSubscribers checks if a topic has subscribers
 func (c *Client) HasSubscribers(topic string) bool {
 	messageID := c.generateMessageID(topic, "hasSubs")
-	message := WSMessage{
-		Type:  "has_subscribers",
-		Topic: topic,
-		ID:    messageID,
-	}
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "has_subscribers"
+	msg.Topic = topic
+	msg.ID = messageID
 
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
 	defer c.pending.Delete(messageID)
 
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
 		return false
 	}
@@ -609,18 +819,16 @@ func (c *Client) HasSubscribers(topic string) bool {
 
 // PublishToServer sends a message to another server
 func (c *Client) PublishToServer(serverAddr string, msg map[string]any, opts *PublishOptions, path ...string) bool {
-	payl := map[string]any{
-		"server_addr": serverAddr,
-		"data":        msg,
-	}
-	if len(path) > 0 {
-		payl["path"] = path[0]
-	}
 	messageID := c.generateMessageID(serverAddr, "pubToServer")
-	message := WSMessage{
-		Type:    "send_to_server",
-		ID:      messageID,
-		Payload: payl,
+	message := c.getWSMessage()
+	defer c.putWSMessage(message)
+	message.reset()
+	message.Type = "send_to_server"
+	message.ID = messageID
+	message.Payload["server_addr"] = serverAddr
+	message.Payload["data"] = msg
+	if len(path) > 0 {
+		message.Payload["path"] = path[0]
 	}
 
 	err := c.conn.WriteJSON(message)
@@ -645,33 +853,27 @@ func (c *Client) PublishToServer(serverAddr string, msg map[string]any, opts *Pu
 	return resp.Type == "published"
 }
 
-// Close closes the WebSocket connection
-func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn != nil {
-		return c.conn.Close()
-	}
-	return nil
-}
-
 func (c *Client) unsubscribe(topic, subID string) {
 	messageID := c.generateMessageID(topic, "unsub-"+subID)
-	message := WSMessage{
-		Type:  "unsubscribe",
-		Topic: topic,
-		ID:    messageID,
-		Payload: map[string]any{
-			"subID": subID,
-		},
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.reset()
+	msg.Type = "unsubscribe"
+	msg.Topic = topic
+	msg.Target = subID
+	msg.ID = messageID
+	msg.Payload["subID"] = subID
+	if c.debug {
+		c.debugTitle("unsub")
+		c.debugLog("unsub from topic='%s', subID='%s'", topic, subID)
 	}
-
 	// Create response channel before sending
 	respChan := make(chan *WSMessage, 1)
 	c.pending.Set(messageID, respChan)
-
-	data, _ := json.Marshal(message)
-	err := c.conn.WriteMessage(ws.TextMessage, data)
+	if c.debug {
+		c.debugLog("sending unsub message %+v", msg)
+	}
+	err := c.conn.WriteJSON(msg)
 	if err != nil {
 		c.pending.Delete(messageID)
 		return
@@ -681,14 +883,35 @@ func (c *Client) unsubscribe(topic, subID string) {
 	select {
 	case resp := <-respChan:
 		if resp != nil && resp.Type == "unsubscribed" {
-			c.handlers.Delete(topic)
+			// Clean up both specific and topic-level handlers
+			handlerKey := topic + "-" + subID
+			if c.debug {
+				c.debugLog("unsub confirmed, deleting handler %s", handlerKey)
+			}
+
+			c.handlers.Delete(handlerKey)
 		}
 	case <-time.After(5 * time.Second):
-		// Timeout, but still delete the handler
-		c.handlers.Delete(topic)
+		// Timeout, but still delete both handlers
+		handlerKey := topic + "-" + subID
+		c.handlers.Delete(handlerKey)
 	}
 
 	c.pending.Delete(messageID)
+}
+
+// Close closes the WebSocket connection
+func (c *Client) Close() error {
+	if c.debug {
+		c.debugLog("closing client")
+	}
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	if c.debug {
+		c.debugLog("closed")
+	}
+	return nil
 }
 
 type clientSubscription struct {
@@ -702,6 +925,9 @@ func (s *clientSubscription) GetTopic() string {
 }
 
 func (s *clientSubscription) Unsubscribe() {
+	if s.client.debug {
+		s.client.debugTitle("clientSubscription unsub from topic='%s' subID='%s'", s.topic, s.subID)
+	}
 	if s.client != nil {
 		s.client.unsubscribe(s.topic, s.subID)
 	}
@@ -717,14 +943,19 @@ func (c *Client) CreateStatePool(config StatefulPoolConfig) error {
 		"state_size_mb": config.StateSizeMB,
 	}
 
-	msg := WSMessage{
-		Type: "create_state_pool",
-		ID:   c.generateMessageID("create-state-pool-client-go", config.Name),
-		Payload: map[string]any{
-			"config": serializableConfig,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "create_state_pool"
+	msg.ID = c.generateMessageID("create-state-pool-client-go", config.Name)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["config"] = serializableConfig
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // RemovePoolHandler removes the message handler for a specific pool
@@ -735,35 +966,45 @@ func (c *Client) RemovePoolHandler(poolName string) {
 
 // SavePoolState persists a pool's state to disk
 func (c *Client) SavePoolState(poolName string, directory string) error {
-	msg := WSMessage{
-		Type: "save_pool_state",
-		ID:   c.generateMessageID("save-state-pool", poolName+"-"+directory),
-		Payload: map[string]any{
-			"pool":      poolName,
-			"directory": directory,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "save_pool_state"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.MsgID = ""
+	msg.ID = c.generateMessageID("save-state-pool", poolName+"-"+directory)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendPoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["directory"] = directory
+	err := c.sendPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // LoadPoolState loads a pool's state from disk
 func (c *Client) LoadPoolState(poolName string, directory string) error {
-	msg := WSMessage{
-		Type: "load_pool_state",
-		ID:   c.generateMessageID("load-pool-state", poolName+"-"+directory),
-		Payload: map[string]any{
-			"pool":      poolName,
-			"directory": directory,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "load_pool_state"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.MsgID = ""
+	msg.ID = c.generateMessageID("load-pool-state", poolName+"-"+directory)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendPoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["directory"] = directory
+	err := c.sendPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
-// Helper function to send pool messages and handle responses
-func (c *Client) sendPoolMessage(msg WSMessage) error {
-	c.mu.Lock()
+// sendPoolMessage sends a message to a pool and handles the response
+func (c *Client) sendPoolMessage(msg *WSMessage) error {
 	if c.conn == nil || !c.isConnected {
-		c.mu.Unlock()
 		return fmt.Errorf("client not connected")
 	}
 
@@ -774,10 +1015,8 @@ func (c *Client) sendPoolMessage(msg WSMessage) error {
 
 	// Send request
 	if err := c.conn.WriteJSON(msg); err != nil {
-		c.mu.Unlock()
 		return fmt.Errorf("failed to send pool message: %w", err)
 	}
-	c.mu.Unlock()
 
 	// Wait for response with timeout
 	resp, err := c.waitForResponse(msg.ID, 10*time.Second)
@@ -797,30 +1036,37 @@ func (c *Client) sendPoolMessage(msg WSMessage) error {
 
 // SendToStatePool sends a message to a specific state pool
 func (c *Client) SendToStatePool(poolName string, data any) error {
-	msg := WSMessage{
-		Type: "state_pool_message",
-		ID:   c.generateMessageID("send-to-state-pool", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-			"data": data,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "state_pool_message"
+	msg.ID = c.generateMessageID("send-to-state-pool", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["data"] = data
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // GetState retrieves the current state of a state pool
 func (c *Client) GetState(poolName string) (map[string]any, error) {
-	msg := WSMessage{
-		Type: "state_pool_state",
-		ID:   c.generateMessageID("getstate", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "state_pool_state"
+	msg.ID = c.generateMessageID("getstate", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
+	msg.Payload["pool"] = poolName
 
-	c.mu.Lock()
 	if c.conn == nil || !c.isConnected {
-		c.mu.Unlock()
+		c.putWSMessage(msg)
 		return nil, fmt.Errorf("client not connected")
 	}
 
@@ -831,16 +1077,19 @@ func (c *Client) GetState(poolName string) (map[string]any, error) {
 
 	// Send request
 	if err := c.conn.WriteJSON(msg); err != nil {
-		c.mu.Unlock()
+		c.putWSMessage(msg)
 		return nil, fmt.Errorf("failed to send state request: %w", err)
 	}
-	c.mu.Unlock()
 
 	// Wait for response with timeout
 	resp, err := c.waitForResponse(msg.ID, 10*time.Second)
+	// Now we can safely put the original message back
+	c.putWSMessage(msg)
+
 	if err != nil {
 		return nil, err
 	}
+	defer c.putWSMessage(resp)
 
 	if resp.Type == "error" {
 		if errMsg, ok := resp.Payload["error"].(string); ok {
@@ -869,90 +1118,125 @@ func (c *Client) OnStatePoolMessage(poolName string, handler func(data any)) {
 
 // UpdateStatePool updates specific state values in a state pool
 func (c *Client) UpdateStatePool(poolName string, updates map[string]any) error {
-	msg := WSMessage{
-		Type: "update_state_pool",
-		ID:   c.generateMessageID("update-state", poolName),
-		Payload: map[string]any{
-			"pool":    poolName,
-			"updates": updates,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "update_state_pool"
+	msg.ID = c.generateMessageID("update-state", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["updates"] = updates
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // DeleteStatePoolKeys deletes specific keys from a state pool's state
 func (c *Client) DeleteStatePoolKeys(poolName string, keys []string) error {
-	msg := WSMessage{
-		Type: "delete_state_pool_keys",
-		ID:   c.generateMessageID("delete-state", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-			"keys": keys,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "delete_state_pool_keys"
+	msg.ID = c.generateMessageID("delete-state", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["keys"] = keys
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // ClearStatePool removes all values from a state pool's state
 func (c *Client) ClearStatePool(poolName string) error {
-	msg := WSMessage{
-		Type: "clear_state_pool",
-		ID:   c.generateMessageID("clear-state", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "clear_state_pool"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = c.generateMessageID("clear-state", poolName)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // SaveStatePool persists a state pool's state to disk
 func (c *Client) SaveStatePool(poolName string, directory string) error {
-	msg := WSMessage{
-		Type: "save_state_pool",
-		ID:   c.generateMessageID("save-state", poolName+"-"+directory),
-		Payload: map[string]any{
-			"pool":      poolName,
-			"directory": directory,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "save_state_pool"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = c.generateMessageID("save-state", poolName+"-"+directory)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["directory"] = directory
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // LoadStatePool loads a state pool's state from disk
 func (c *Client) LoadStatePool(poolName string, directory string) error {
-	msg := WSMessage{
-		Type: "load_state_pool",
-		ID:   c.generateMessageID("load-state", poolName+"-"+directory),
-		Payload: map[string]any{
-			"pool":      poolName,
-			"directory": directory,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "load_state_pool"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = c.generateMessageID("load-state", poolName+"-"+directory)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["directory"] = directory
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // StopStatePool stops a state pool's processing
 func (c *Client) StopStatePool(poolName string) error {
-	msg := WSMessage{
-		Type: "stop_state_pool",
-		ID:   c.generateMessageID("stop-state", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "stop_state_pool"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = c.generateMessageID("stop-state", poolName)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // RemoveStatePool stops and removes a state pool
 func (c *Client) RemoveStatePool(poolName string) error {
-	msg := WSMessage{
-		Type: "remove_state_pool",
-		ID:   c.generateMessageID("remove-state", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "remove_state_pool"
+	msg.Topic = ""
+	msg.Target = ""
+	msg.ID = c.generateMessageID("remove-state", poolName)
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendStatePoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	err := c.sendStatePoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // RemoveStatePoolHandler removes the message handler for a specific state pool
@@ -961,11 +1245,9 @@ func (c *Client) RemoveStatePoolHandler(poolName string) {
 	c.handlers.Delete(handlerID)
 }
 
-// Helper function to send state pool messages and handle responses
-func (c *Client) sendStatePoolMessage(msg WSMessage) error {
-	c.mu.Lock()
+// sendStatePoolMessage sends a message to a state pool and handles the response
+func (c *Client) sendStatePoolMessage(msg *WSMessage) error {
 	if c.conn == nil || !c.isConnected {
-		c.mu.Unlock()
 		return fmt.Errorf("client not connected")
 	}
 
@@ -976,10 +1258,8 @@ func (c *Client) sendStatePoolMessage(msg WSMessage) error {
 
 	// Send request
 	if err := c.conn.WriteJSON(msg); err != nil {
-		c.mu.Unlock()
 		return fmt.Errorf("failed to send state pool message: %w", err)
 	}
-	c.mu.Unlock()
 
 	// Wait for response with timeout
 	resp, err := c.waitForResponse(msg.ID, 10*time.Second)
@@ -999,30 +1279,40 @@ func (c *Client) sendStatePoolMessage(msg WSMessage) error {
 
 // CreateActorPool creates a new actor pool on the server
 func (c *Client) CreateActorPool(name string, size int) error {
-	msg := WSMessage{
-		Type: "create_actor_pool",
-		ID:   c.generateMessageID("create-actor", name),
-		Payload: map[string]any{
-			"config": map[string]any{
-				"name": name,
-				"size": size,
-			},
-		},
+	msg := c.getWSMessage()
+	msg.Type = "create_actor_pool"
+	msg.ID = c.generateMessageID("create-actor", name)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendActorPoolMessage(msg)
+	msg.Payload["config"] = map[string]any{
+		"name": name,
+		"size": size,
+	}
+	err := c.sendActorPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // SendToActorPool sends a message to a specific actor pool
 func (c *Client) SendToActorPool(poolName string, data any) error {
-	msg := WSMessage{
-		Type: "actor_pool_message",
-		ID:   c.generateMessageID("send-actor", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-			"data": data,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "actor_pool_message"
+	msg.ID = c.generateMessageID("send-actor", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendActorPoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	msg.Payload["data"] = data
+	err := c.sendActorPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // OnActorPoolMessage registers a handler for messages from a specific actor pool
@@ -1043,33 +1333,41 @@ func (c *Client) RemoveActorPoolHandler(poolName string) {
 
 // StopActorPool stops an actor pool's processing
 func (c *Client) StopActorPool(poolName string) error {
-	msg := WSMessage{
-		Type: "stop_actor_pool",
-		ID:   c.generateMessageID("stop-actor", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "stop_actor_pool"
+	msg.ID = c.generateMessageID("stop-actor", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendActorPoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	err := c.sendActorPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
 // RemoveActorPool stops and removes an actor pool
 func (c *Client) RemoveActorPool(poolName string) error {
-	msg := WSMessage{
-		Type: "remove_actor_pool",
-		ID:   c.generateMessageID("remove-actor", poolName),
-		Payload: map[string]any{
-			"pool": poolName,
-		},
+	msg := c.getWSMessage()
+	msg.Type = "remove_actor_pool"
+	msg.ID = c.generateMessageID("remove-actor", poolName)
+	msg.Topic = ""
+	msg.Target = ""
+	// Clear and reuse payload map
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
 	}
-	return c.sendActorPoolMessage(msg)
+	msg.Payload["pool"] = poolName
+	err := c.sendActorPoolMessage(msg)
+	c.putWSMessage(msg)
+	return err
 }
 
-// Helper function to send actor pool messages and handle responses
-func (c *Client) sendActorPoolMessage(msg WSMessage) error {
-	c.mu.Lock()
+// sendActorPoolMessage sends a message to an actor pool and handles the response
+func (c *Client) sendActorPoolMessage(msg *WSMessage) error {
 	if c.conn == nil || !c.isConnected {
-		c.mu.Unlock()
 		return fmt.Errorf("client not connected")
 	}
 
@@ -1080,10 +1378,8 @@ func (c *Client) sendActorPoolMessage(msg WSMessage) error {
 
 	// Send request
 	if err := c.conn.WriteJSON(msg); err != nil {
-		c.mu.Unlock()
 		return fmt.Errorf("failed to send actor pool message: %w", err)
 	}
-	c.mu.Unlock()
 
 	// Wait for response with timeout
 	resp, err := c.waitForResponse(msg.ID, 10*time.Second)
@@ -1099,4 +1395,22 @@ func (c *Client) sendActorPoolMessage(msg WSMessage) error {
 	}
 
 	return nil
+}
+
+// getWSMessage gets a message from the pool and returns it
+func (c *Client) getWSMessage() *WSMessage {
+	return c.msgPool.Get().(*WSMessage)
+}
+
+// putWSMessage resets and returns a message to the pool
+func (c *Client) putWSMessage(msg *WSMessage) {
+	msg.Type = ""
+	msg.Topic = ""
+	msg.ID = ""
+	msg.Target = ""
+	msg.MsgID = ""
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
+	}
+	c.msgPool.Put(msg)
 }

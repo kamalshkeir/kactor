@@ -634,36 +634,74 @@ class Kactor:
 
     async def publish(self, topic: str, payload: Dict[str, Any], options: Optional[PublishOptions] = None) -> bool:
         """Publish a message to a topic."""
-        message_id = str(uuid.uuid4())
+        if not self.ws or not self.connected:
+            if options and options.on_failure:
+                options.on_failure(Exception("Not connected"))
+            return False
+
+        msg_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
         message = {
             'type': 'publish',
             'topic': topic,
-            'id': message_id,
+            'id': msg_id,
             'payload': payload
         }
 
-        if not self.ws:
-            if options and options.on_failure:
-                options.on_failure(Exception("Not connected"))
-            return False
+        if options is None:
+            message['payload']['no_ack'] = True
+            try:
+                async with self._lock:
+                    await self.ws.send(json.dumps(message))
+                return True
+            except Exception as e:
+                return False
+
+        future = asyncio.Future()
+        self._pending_messages[msg_id] = future
 
         try:
-            await self.ws.send(json.dumps(message))
-            if options and options.on_success:
-                options.on_success()
-            return True
+            async with self._lock:
+                await self.ws.send(json.dumps(message))
+            
+            try:
+                response = await asyncio.wait_for(future, 5.0)
+                if response['type'] == 'published':
+                    if options.on_success:
+                        options.on_success()
+                    return True
+                elif response['type'] == 'error':
+                    error = response.get('payload', {}).get('error', 'publish failed')
+                    if options.on_failure:
+                        options.on_failure(Exception(error))
+                    return False
+            except asyncio.TimeoutError:
+                if options.on_failure:
+                    options.on_failure(Exception('publish timeout'))
+                return False
+            except Exception as e:
+                if options.on_failure:
+                    options.on_failure(e)
+                return False
+            return False
         except Exception as e:
-            if options and options.on_failure:
+            if options.on_failure:
                 options.on_failure(e)
             return False
+        finally:
+            self._pending_messages.pop(msg_id, None)
 
     async def publish_with_retry(self, topic: str, payload: Dict[str, Any], retry_config: RetryConfig, options: Optional[PublishOptions] = None) -> bool:
         """Publish a message with retry configuration."""
-        message_id = str(uuid.uuid4())
+        if not self.ws or not self.connected:
+            if options and options.on_failure:
+                options.on_failure(Exception("Not connected"))
+            return False
+
+        msg_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
         message = {
             'type': 'publishWithRetry',
             'topic': topic,
-            'id': message_id,
+            'id': msg_id,
             'payload': {
                 'data': payload,
                 'retry_config': {
@@ -673,54 +711,120 @@ class Kactor:
             }
         }
 
-        if not self.ws:
+        if options is None:
+            message['payload']['no_ack'] = True
+            try:
+                async with self._lock:
+                    await self.ws.send(json.dumps(message))
+                return True
+            except Exception as e:
+                return False
+
+        future = asyncio.Future()
+        self._pending_messages[msg_id] = future
+
+        try:
+            async with self._lock:
+                await self.ws.send(json.dumps(message))
+            
+            try:
+                response = await asyncio.wait_for(future, 5.0)
+                if response['type'] == 'published':
+                    if options.on_success:
+                        options.on_success()
+                    return True
+                elif response['type'] == 'error':
+                    error = response.get('payload', {}).get('error', 'publish failed')
+                    if options.on_failure:
+                        options.on_failure(Exception(error))
+                    return False
+            except asyncio.TimeoutError:
+                if options.on_failure:
+                    options.on_failure(Exception('publish timeout'))
+                return False
+            except Exception as e:
+                if options.on_failure:
+                    options.on_failure(e)
+                return False
+            return False
+        except Exception as e:
+            if options.on_failure:
+                options.on_failure(e)
+            return False
+        finally:
+            self._pending_messages.pop(msg_id, None)
+
+    async def publish_to(self, topic: str, target: str, payload: Dict[str, Any], options: Optional[PublishOptions] = None) -> bool:
+        """Publish a message directly to a specific client."""
+        if not self.ws or not self.connected:
             if options and options.on_failure:
                 options.on_failure(Exception("Not connected"))
             return False
 
-        try:
-            await self.ws.send(json.dumps(message))
-            if options and options.on_success:
-                options.on_success()
-            return True
-        except Exception as e:
-            if options and options.on_failure:
-                options.on_failure(e)
-            return False
-
-    async def publish_to(self, topic: str, target: str, payload: Dict[str, Any], options: Optional[PublishOptions] = None) -> bool:
-        """Publish a message directly to a specific client."""
-        message_id = str(uuid.uuid4())
+        msg_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
         message = {
             'type': 'publishTo',
             'topic': topic,
-            'id': message_id,
+            'id': msg_id,
             'target': target,
             'payload': payload
         }
 
-        if not self.ws:
+        if options is None:
+            message['payload']['no_ack'] = True
+            try:
+                async with self._lock:
+                    await self.ws.send(json.dumps(message))
+                return True
+            except Exception as e:
+                return False
+
+        future = asyncio.Future()
+        self._pending_messages[msg_id] = future
+
+        try:
+            async with self._lock:
+                await self.ws.send(json.dumps(message))
+            
+            try:
+                response = await asyncio.wait_for(future, 5.0)
+                if response['type'] == 'published':
+                    if options.on_success:
+                        options.on_success()
+                    return True
+                elif response['type'] == 'error':
+                    error = response.get('payload', {}).get('error', 'publish failed')
+                    if options.on_failure:
+                        options.on_failure(Exception(error))
+                    return False
+            except asyncio.TimeoutError:
+                if options.on_failure:
+                    options.on_failure(Exception('publish timeout'))
+                return False
+            except Exception as e:
+                if options.on_failure:
+                    options.on_failure(e)
+                return False
+            return False
+        except Exception as e:
+            if options.on_failure:
+                options.on_failure(e)
+            return False
+        finally:
+            self._pending_messages.pop(msg_id, None)
+
+    async def publish_to_with_retry(self, topic: str, target: str, payload: Dict[str, Any], retry_config: RetryConfig, options: Optional[PublishOptions] = None) -> bool:
+        """Publish a message directly to a specific client with retry configuration."""
+        if not self.ws or not self.connected:
             if options and options.on_failure:
                 options.on_failure(Exception("Not connected"))
             return False
 
-        try:
-            await self.ws.send(json.dumps(message))
-            if options and options.on_success:
-                options.on_success()
-            return True
-        except Exception as e:
-            if options and options.on_failure:
-                options.on_failure(e)
-            return False
-
-    async def publish_to_with_retry(self, topic: str, target: str, payload: Dict[str, Any], retry_config: RetryConfig, options: Optional[PublishOptions] = None) -> bool:
-        """Publish a message directly to a specific client with retry configuration."""
-        message_id = str(uuid.uuid4())
+        msg_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
         message = {
             'type': 'publishToWithRetry',
             'topic': topic,
-            'id': message_id,
+            'id': msg_id,
             'target': target,
             'payload': {
                 'data': payload,
@@ -731,20 +835,48 @@ class Kactor:
             }
         }
 
-        if not self.ws:
-            if options and options.on_failure:
-                options.on_failure(Exception("Not connected"))
-            return False
+        if options is None:
+            message['payload']['no_ack'] = True
+            try:
+                async with self._lock:
+                    await self.ws.send(json.dumps(message))
+                return True
+            except Exception as e:
+                return False
+
+        future = asyncio.Future()
+        self._pending_messages[msg_id] = future
 
         try:
-            await self.ws.send(json.dumps(message))
-            if options and options.on_success:
-                options.on_success()
-            return True
+            async with self._lock:
+                await self.ws.send(json.dumps(message))
+            
+            try:
+                response = await asyncio.wait_for(future, 5.0)
+                if response['type'] == 'published':
+                    if options.on_success:
+                        options.on_success()
+                    return True
+                elif response['type'] == 'error':
+                    error = response.get('payload', {}).get('error', 'publish failed')
+                    if options.on_failure:
+                        options.on_failure(Exception(error))
+                    return False
+            except asyncio.TimeoutError:
+                if options.on_failure:
+                    options.on_failure(Exception('publish timeout'))
+                return False
+            except Exception as e:
+                if options.on_failure:
+                    options.on_failure(e)
+                return False
+            return False
         except Exception as e:
-            if options and options.on_failure:
+            if options.on_failure:
                 options.on_failure(e)
             return False
+        finally:
+            self._pending_messages.pop(msg_id, None)
 
     async def has_subscribers(self, topic: str) -> bool:
         """Check if a topic has any subscribers."""

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kamalshkeir/kmap"
 	"github.com/kamalshkeir/ksmux/ws"
+	"github.com/kamalshkeir/ksmux/wspool"
 )
 
 // NewPubSub creates a new PubSub
@@ -64,59 +65,7 @@ func (ps *PubSub) WithDebug(enabled bool) {
 
 // debugLog prints debug messages if debug mode is enabled
 func (ps *PubSub) debugLog(format string, args ...interface{}) {
-	if ps.debug {
-		fmt.Printf("[LowAllocPubSub] "+format+"\n", args...)
-	}
-}
-
-// Unsubscribe implements the Subscription interface
-func (s *psSubscription) Unsubscribe() {
-	ps := s.pubsub
-	if atomic.LoadInt32(&ps.closed) == 1 {
-		return
-	}
-	if ps.debug {
-		ps.debugLog("Unsubscribing from topic %s with subID %s", s.topic, s.subID)
-	}
-	atomic.AddInt32(&ps.userCount, -1)
-
-	// Check patterns first
-	if list, exists := ps.patterns.Get(s.topic); exists {
-		list.mu.Lock()
-		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.subID == s.subID {
-				// Move last element to this position
-				lastIdx := atomic.LoadInt32(&list.count) - 1
-				list.subs[i] = list.subs[lastIdx]
-				list.subs[lastIdx] = nil
-				atomic.AddInt32(&list.count, -1)
-				break
-			}
-		}
-		list.mu.Unlock()
-		if atomic.LoadInt32(&list.count) == 0 {
-			ps.patterns.Delete(s.topic)
-		}
-	}
-
-	// Check subscribers
-	if list, exists := ps.subscribers.Get(s.topic); exists {
-		list.mu.Lock()
-		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.subID == s.subID {
-				// Move last element to this position
-				lastIdx := atomic.LoadInt32(&list.count) - 1
-				list.subs[i] = list.subs[lastIdx]
-				list.subs[lastIdx] = nil
-				atomic.AddInt32(&list.count, -1)
-				break
-			}
-		}
-		list.mu.Unlock()
-		if atomic.LoadInt32(&list.count) == 0 {
-			ps.subscribers.Delete(s.topic)
-		}
-	}
+	fmt.Printf("[PubSub] "+format+"\n", args...)
 }
 
 // GetTopic implements the Subscription interface
@@ -261,6 +210,9 @@ func (ps *PubSub) Subscribe(topic, subID string, handler func(map[string]any, Su
 	// Check if we already have this subscription
 	for i := int32(0); i < list.count; i++ {
 		if node := list.subs[i]; node != nil && node.subID == subID {
+			if ps.debug {
+				ps.debugLog("ALready subscribed to topic %s with subID %s", topic, subID)
+			}
 			return node.sub
 		}
 	}
@@ -272,6 +224,9 @@ func (ps *PubSub) Subscribe(topic, subID string, handler func(map[string]any, Su
 			list.subs[i] = &psSubNode{handler: handler, subID: subID, sub: sub}
 			if i >= list.count {
 				atomic.StoreInt32(&list.count, i+1)
+			}
+			if ps.debug {
+				ps.debugLog("Subscribed with success to topic %s with subID %s", topic, subID)
 			}
 			return sub
 		}
@@ -429,13 +384,15 @@ func (ps *PubSub) Publish(topic string, payload map[string]any, opts *PublishOpt
 	}
 
 	// Handle callbacks without allocations
-	if success {
-		if opts != nil && opts.OnSuccess != nil {
-			opts.OnSuccess()
-		}
-	} else {
-		if opts != nil && opts.OnFailure != nil {
-			opts.OnFailure(fmt.Errorf("no subscribers found for topic: %s", topic))
+	if opts != nil {
+		if success {
+			if opts.OnSuccess != nil {
+				opts.OnSuccess()
+			}
+		} else {
+			if opts.OnFailure != nil {
+				opts.OnFailure(fmt.Errorf("no subscribers found for topic: %s", topic))
+			}
 		}
 	}
 
@@ -618,7 +575,7 @@ func (ps *PubSub) Close() {
 }
 
 // CleanupConnection cleans up resources associated with a WebSocket connection
-func (ps *PubSub) CleanupConnection(conn *ws.Conn) {
+func (ps *PubSub) CleanupConnection(conn *wspool.Conn) {
 	if ps.debug {
 		ps.debugLog("Starting cleanup for connection %p", conn)
 	}
@@ -628,7 +585,7 @@ func (ps *PubSub) CleanupConnection(conn *ws.Conn) {
 		list.mu.Lock()
 		// Find and remove all subscriptions for this connection
 		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.conn == conn {
+			if node := list.subs[i]; node != nil && node.conn == conn.WSConn() {
 				if ps.debug {
 					ps.debugLog("Removing subscription for connection %p from topic %s", conn, topic)
 				}
@@ -658,7 +615,7 @@ func (ps *PubSub) CleanupConnection(conn *ws.Conn) {
 		list.mu.Lock()
 		// Find and remove all subscriptions for this connection
 		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.conn == conn {
+			if node := list.subs[i]; node != nil && node.conn == conn.WSConn() {
 				if ps.debug {
 					ps.debugLog("Removing pattern subscription for connection %p from pattern %s", conn, pattern)
 				}
@@ -952,6 +909,70 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 		}
 	}
 	return nil
+}
+
+// Unsubscribe implements the Subscription interface
+func (s *psSubscription) Unsubscribe() {
+	s.pubsub.Unsubscribe(s.topic, s.subID)
+}
+
+// Unsubscribe removes a subscription for a given topic and subID
+func (ps *PubSub) Unsubscribe(topic, subID string) bool {
+
+	if atomic.LoadInt32(&ps.closed) == 1 {
+		return false
+	}
+	if ps.debug {
+		ps.debugLog("Unsubscribing from topic %s with subID %s", topic, subID)
+	}
+
+	// Check patterns first for better performance in most cases
+	if list, exists := ps.patterns.Get(topic); exists {
+		list.mu.Lock()
+		for i := int32(0); i < list.count; i++ {
+			if node := list.subs[i]; node != nil && node.subID == subID {
+				// Move last element to this position for O(1) removal
+				lastIdx := atomic.LoadInt32(&list.count) - 1
+				list.subs[i] = list.subs[lastIdx]
+				list.subs[lastIdx] = nil
+				atomic.AddInt32(&list.count, -1)
+				atomic.AddInt32(&ps.userCount, -1)
+				list.mu.Unlock()
+
+				// Remove empty list
+				if atomic.LoadInt32(&list.count) == 0 {
+					ps.patterns.Delete(topic)
+				}
+				return true
+			}
+		}
+		list.mu.Unlock()
+	}
+
+	// Check direct subscribers
+	if list, exists := ps.subscribers.Get(topic); exists {
+		list.mu.Lock()
+		for i := int32(0); i < list.count; i++ {
+			if node := list.subs[i]; node != nil && node.subID == subID {
+				// Move last element to this position for O(1) removal
+				lastIdx := atomic.LoadInt32(&list.count) - 1
+				list.subs[i] = list.subs[lastIdx]
+				list.subs[lastIdx] = nil
+				atomic.AddInt32(&list.count, -1)
+				atomic.AddInt32(&ps.userCount, -1)
+				list.mu.Unlock()
+
+				// Remove empty list
+				if atomic.LoadInt32(&list.count) == 0 {
+					ps.subscribers.Delete(topic)
+				}
+				return true
+			}
+		}
+		list.mu.Unlock()
+	}
+
+	return false
 }
 
 // PS C:\Users\kamal\Desktop\kactor> go test -bench=^. -benchmem

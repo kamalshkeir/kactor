@@ -678,17 +678,57 @@ class Kactor {
             payload: message
         };
 
-        try {
-            await this.ws.send(JSON.stringify(msg));
-            if (options?.onSuccess) {
-                options.onSuccess();
+        if (options === null) {
+            msg.payload.no_ack = true;
+            try {
+                await this.ws.send(JSON.stringify(msg));
+                return true;
+            } catch (e) {
+                return false;
             }
-            return true;
+        }
+
+        try {
+            // Create response promise before sending
+            const responsePromise = new Promise((resolve, reject) => {
+                const handler = {resolve, reject};
+                this._pending_messages.set(messageId, handler);
+                setTimeout(() => {
+                    this._pending_messages.delete(messageId);
+                    reject(new Error('publish timeout'));
+                }, 5000);
+            });
+
+            await this.ws.send(JSON.stringify(msg));
+            
+            try {
+                const response = await responsePromise;
+                if (response.type === 'published') {
+                    if (options.onSuccess) {
+                        options.onSuccess();
+                    }
+                    return true;
+                } else if (response.type === 'error') {
+                    const error = response.payload?.error || 'publish failed';
+                    if (options.onFailure) {
+                        options.onFailure(new Error(error));
+                    }
+                    return false;
+                }
+            } catch (e) {
+                if (options.onFailure) {
+                    options.onFailure(e);
+                }
+                return false;
+            }
+            return false;
         } catch (e) {
-            if (options?.onFailure) {
+            if (options.onFailure) {
                 options.onFailure(e);
             }
             return false;
+        } finally {
+            this._pending_messages.delete(messageId);
         }
     }
 
@@ -715,17 +755,57 @@ class Kactor {
             }
         };
 
-        try {
-            await this.ws.send(JSON.stringify(msg));
-            if (options?.onSuccess) {
-                options.onSuccess();
+        if (options === null) {
+            msg.payload.no_ack = true;
+            try {
+                await this.ws.send(JSON.stringify(msg));
+                return true;
+            } catch (e) {
+                return false;
             }
-            return true;
+        }
+
+        try {
+            // Create response promise before sending
+            const responsePromise = new Promise((resolve, reject) => {
+                const handler = {resolve, reject};
+                this._pending_messages.set(messageId, handler);
+                setTimeout(() => {
+                    this._pending_messages.delete(messageId);
+                    reject(new Error('publish timeout'));
+                }, 5000);
+            });
+
+            await this.ws.send(JSON.stringify(msg));
+            
+            try {
+                const response = await responsePromise;
+                if (response.type === 'published') {
+                    if (options.onSuccess) {
+                        options.onSuccess();
+                    }
+                    return true;
+                } else if (response.type === 'error') {
+                    const error = response.payload?.error || 'publish failed';
+                    if (options.onFailure) {
+                        options.onFailure(new Error(error));
+                    }
+                    return false;
+                }
+            } catch (e) {
+                if (options.onFailure) {
+                    options.onFailure(e);
+                }
+                return false;
+            }
+            return false;
         } catch (e) {
-            if (options?.onFailure) {
+            if (options.onFailure) {
                 options.onFailure(e);
             }
             return false;
+        } finally {
+            this._pending_messages.delete(messageId);
         }
     }
 
@@ -747,17 +827,57 @@ class Kactor {
             payload: payload
         };
 
-        try {
-            await this.ws.send(JSON.stringify(msg));
-            if (options?.onSuccess) {
-                options.onSuccess();
+        if (options === null) {
+            msg.payload.no_ack = true;
+            try {
+                await this.ws.send(JSON.stringify(msg));
+                return true;
+            } catch (e) {
+                return false;
             }
-            return true;
+        }
+
+        try {
+            // Create response promise before sending
+            const responsePromise = new Promise((resolve, reject) => {
+                const handler = {resolve, reject};
+                this._pending_messages.set(messageId, handler);
+                setTimeout(() => {
+                    this._pending_messages.delete(messageId);
+                    reject(new Error('publish timeout'));
+                }, 5000);
+            });
+
+            await this.ws.send(JSON.stringify(msg));
+            
+            try {
+                const response = await responsePromise;
+                if (response.type === 'published') {
+                    if (options.onSuccess) {
+                        options.onSuccess();
+                    }
+                    return true;
+                } else if (response.type === 'error') {
+                    const error = response.payload?.error || 'publish failed';
+                    if (options.onFailure) {
+                        options.onFailure(new Error(error));
+                    }
+                    return false;
+                }
+            } catch (e) {
+                if (options.onFailure) {
+                    options.onFailure(e);
+                }
+                return false;
+            }
+            return false;
         } catch (e) {
-            if (options?.onFailure) {
+            if (options.onFailure) {
                 options.onFailure(e);
             }
             return false;
+        } finally {
+            this._pending_messages.delete(messageId);
         }
     }
 
@@ -786,17 +906,57 @@ class Kactor {
             }
         };
 
-        try {
-            await this.ws.send(JSON.stringify(msg));
-            if (options?.onSuccess) {
-                options.onSuccess();
+        if (options === null) {
+            msg.payload.no_ack = true;
+            try {
+                await this.ws.send(JSON.stringify(msg));
+                return true;
+            } catch (e) {
+                return false;
             }
-            return true;
+        }
+
+        try {
+            // Create response promise before sending
+            const responsePromise = new Promise((resolve, reject) => {
+                const handler = {resolve, reject};
+                this._pending_messages.set(messageId, handler);
+                setTimeout(() => {
+                    this._pending_messages.delete(messageId);
+                    reject(new Error('publish timeout'));
+                }, 5000);
+            });
+
+            await this.ws.send(JSON.stringify(msg));
+            
+            try {
+                const response = await responsePromise;
+                if (response.type === 'published') {
+                    if (options.onSuccess) {
+                        options.onSuccess();
+                    }
+                    return true;
+                } else if (response.type === 'error') {
+                    const error = response.payload?.error || 'publish failed';
+                    if (options.onFailure) {
+                        options.onFailure(new Error(error));
+                    }
+                    return false;
+                }
+            } catch (e) {
+                if (options.onFailure) {
+                    options.onFailure(e);
+                }
+                return false;
+            }
+            return false;
         } catch (e) {
-            if (options?.onFailure) {
+            if (options.onFailure) {
                 options.onFailure(e);
             }
             return false;
+        } finally {
+            this._pending_messages.delete(messageId);
         }
     }
 
