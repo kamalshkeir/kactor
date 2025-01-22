@@ -214,7 +214,6 @@ func (c *Client) debugLines() {
 func (c *Client) handleMessages() {
 	for {
 		msg := c.getWSMessage()
-		msg.reset()
 		defer c.putWSMessage(msg)
 		err := c.conn.ReadJSON(&msg)
 		if err != nil {
@@ -250,7 +249,6 @@ func (c *Client) handleMessages() {
 			} else if c.debug {
 				c.debugLog("[handleMessages](%s) handler not found for key='%s', topic='%s'", msg.Type, handlerKey, msg.Topic)
 			}
-			c.putWSMessage(msg)
 		case "state_pool_message":
 			if c.debug {
 				c.debugTitle("'%s'", msg.Type)
@@ -276,7 +274,6 @@ func (c *Client) handleMessages() {
 					c.debugLog("[handleMessages](%s) missing 'pool' in payload %+v", msg.Type, msg.Payload)
 				}
 			}
-			c.putWSMessage(msg)
 		case "error", "published", "subscribed", "unsubscribed", "subscribers_status",
 			"state_pool_created", "state_pool_message_sent", "state_pool_updated",
 			"state_pool_keys_deleted", "state_pool_cleared", "state_pool_saved",
@@ -302,13 +299,11 @@ func (c *Client) handleMessages() {
 					if c.debug {
 						c.debugLog("channel is closed or full, deleting pending %s", msg.ID)
 					}
-					c.putWSMessage(msg)
 				}
 			} else {
 				if c.debug {
 					c.debugLog("channel not found")
 				}
-				c.putWSMessage(msg)
 			}
 		case "actor_pool_message":
 			if c.debug {
@@ -324,12 +319,10 @@ func (c *Client) handleMessages() {
 					})
 				}
 			}
-			c.putWSMessage(msg)
 		default:
 			if c.debug {
 				c.debugLog("hit default case for type='%s', topic='%s', target='%s' id='%s'", msg.Type, msg.Topic, msg.Target, msg.ID)
 			}
-			c.putWSMessage(msg)
 		}
 	}
 }
@@ -382,12 +375,16 @@ func (c *Client) waitForResponse(messageID string, timeout time.Duration) (*WSMe
 		}
 		if resp == nil {
 			c.pending.Delete(messageID)
-			close(respChan)
+			if respChan != nil {
+				close(respChan)
+			}
 			return nil, fmt.Errorf("response channel closed without response")
 		}
 		// Only clean up after we know we have a valid response
 		c.pending.Delete(messageID)
-		close(respChan)
+		if respChan != nil {
+			close(respChan)
+		}
 		if c.debug {
 			c.debugLog("done waiting")
 		}
@@ -395,7 +392,9 @@ func (c *Client) waitForResponse(messageID string, timeout time.Duration) (*WSMe
 	case <-time.After(timeout):
 		// Clean up on timeout
 		c.pending.Delete(messageID)
-		close(respChan)
+		if respChan != nil {
+			close(respChan)
+		}
 		if c.debug {
 			c.debugLog("done waiting without response after %v", timeout)
 		}
@@ -411,7 +410,6 @@ func (c *Client) Subscribe(topic string, subID string, handler func(map[string]a
 	messageID := "sub-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "subscribe"
 	msg.Topic = topic
 	msg.Target = subID
@@ -443,7 +441,6 @@ func (c *Client) Subscribe(topic string, subID string, handler func(map[string]a
 	if err != nil || resp.Type != "subscribed" {
 		if resp != nil {
 			c.debugLog("no response ^^")
-			c.putWSMessage(resp)
 		}
 		return nil
 	}
@@ -471,13 +468,10 @@ func (c *Client) Publish(topic string, payload map[string]any, opts *PublishOpti
 	messageID := "pub-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "publish"
 	msg.Topic = topic
 	msg.ID = messageID
-	for k, v := range payload {
-		msg.Payload[k] = v
-	}
+	msg.Payload = payload
 	if c.debug {
 		c.debugTitle("Publishing...")
 		c.debugLog("publishing to topic='%s' payload='%+v' opts='%+v'", topic, payload, opts)
@@ -567,7 +561,6 @@ func (c *Client) PublishWithRetry(topic string, payload map[string]any, cfg *Ret
 	messageID := "pubretry-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "publishWithRetry"
 	msg.Topic = topic
 	msg.ID = messageID
@@ -637,7 +630,6 @@ func (c *Client) PublishTo(topic, targetID string, payload map[string]any, opts 
 	messageID := "pubto-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "publishTo"
 	msg.Topic = topic
 	msg.Target = targetID
@@ -711,7 +703,6 @@ func (c *Client) PublishToWithRetry(topic string, targetID string, payload map[s
 	messageID := "pubtoretry-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "publishToWithRetry"
 	msg.Topic = topic
 	msg.ID = messageID
@@ -791,7 +782,6 @@ func (c *Client) HasSubscribers(topic string) bool {
 	messageID := c.generateMessageID(topic, "hasSubs")
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "has_subscribers"
 	msg.Topic = topic
 	msg.ID = messageID
@@ -822,8 +812,7 @@ func (c *Client) PublishToServer(serverAddr string, msg map[string]any, opts *Pu
 	messageID := c.generateMessageID(serverAddr, "pubToServer")
 	message := c.getWSMessage()
 	defer c.putWSMessage(message)
-	message.reset()
-	message.Type = "send_to_server"
+	message.Type = "publishToServer"
 	message.ID = messageID
 	message.Payload["server_addr"] = serverAddr
 	message.Payload["data"] = msg
@@ -831,9 +820,18 @@ func (c *Client) PublishToServer(serverAddr string, msg map[string]any, opts *Pu
 		message.Payload["path"] = path[0]
 	}
 
+	if opts == nil {
+		if c.debug {
+			c.debugLog("PublishToServer: no ack %s", serverAddr)
+		}
+		message.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
+	}
+
 	err := c.conn.WriteJSON(message)
 	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
@@ -841,13 +839,13 @@ func (c *Client) PublishToServer(serverAddr string, msg map[string]any, opts *Pu
 
 	resp, err := c.waitForResponse(messageID, 5*time.Second)
 	if err != nil {
-		if opts != nil && opts.OnFailure != nil {
+		if opts.OnFailure != nil {
 			opts.OnFailure(err)
 		}
 		return false
 	}
 
-	if opts != nil && opts.OnSuccess != nil {
+	if opts.OnSuccess != nil {
 		opts.OnSuccess()
 	}
 	return resp.Type == "published"
@@ -857,7 +855,6 @@ func (c *Client) unsubscribe(topic, subID string) {
 	messageID := c.generateMessageID(topic, "unsub-"+subID)
 	msg := c.getWSMessage()
 	defer c.putWSMessage(msg)
-	msg.reset()
 	msg.Type = "unsubscribe"
 	msg.Topic = topic
 	msg.Target = subID
@@ -946,12 +943,6 @@ func (c *Client) CreateStatePool(config StatefulPoolConfig) error {
 	msg := c.getWSMessage()
 	msg.Type = "create_state_pool"
 	msg.ID = c.generateMessageID("create-state-pool-client-go", config.Name)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["config"] = serializableConfig
 	err := c.sendStatePoolMessage(msg)
 	c.putWSMessage(msg)
@@ -968,14 +959,7 @@ func (c *Client) RemovePoolHandler(poolName string) {
 func (c *Client) SavePoolState(poolName string, directory string) error {
 	msg := c.getWSMessage()
 	msg.Type = "save_pool_state"
-	msg.Topic = ""
-	msg.Target = ""
-	msg.MsgID = ""
 	msg.ID = c.generateMessageID("save-state-pool", poolName+"-"+directory)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["directory"] = directory
 	err := c.sendPoolMessage(msg)
@@ -987,14 +971,7 @@ func (c *Client) SavePoolState(poolName string, directory string) error {
 func (c *Client) LoadPoolState(poolName string, directory string) error {
 	msg := c.getWSMessage()
 	msg.Type = "load_pool_state"
-	msg.Topic = ""
-	msg.Target = ""
-	msg.MsgID = ""
 	msg.ID = c.generateMessageID("load-pool-state", poolName+"-"+directory)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["directory"] = directory
 	err := c.sendPoolMessage(msg)
@@ -1039,12 +1016,6 @@ func (c *Client) SendToStatePool(poolName string, data any) error {
 	msg := c.getWSMessage()
 	msg.Type = "state_pool_message"
 	msg.ID = c.generateMessageID("send-to-state-pool", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["data"] = data
 	err := c.sendStatePoolMessage(msg)
@@ -1057,12 +1028,6 @@ func (c *Client) GetState(poolName string) (map[string]any, error) {
 	msg := c.getWSMessage()
 	msg.Type = "state_pool_state"
 	msg.ID = c.generateMessageID("getstate", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 
 	if c.conn == nil || !c.isConnected {
@@ -1121,12 +1086,6 @@ func (c *Client) UpdateStatePool(poolName string, updates map[string]any) error 
 	msg := c.getWSMessage()
 	msg.Type = "update_state_pool"
 	msg.ID = c.generateMessageID("update-state", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["updates"] = updates
 	err := c.sendStatePoolMessage(msg)
@@ -1139,12 +1098,6 @@ func (c *Client) DeleteStatePoolKeys(poolName string, keys []string) error {
 	msg := c.getWSMessage()
 	msg.Type = "delete_state_pool_keys"
 	msg.ID = c.generateMessageID("delete-state", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["keys"] = keys
 	err := c.sendStatePoolMessage(msg)
@@ -1156,13 +1109,7 @@ func (c *Client) DeleteStatePoolKeys(poolName string, keys []string) error {
 func (c *Client) ClearStatePool(poolName string) error {
 	msg := c.getWSMessage()
 	msg.Type = "clear_state_pool"
-	msg.Topic = ""
-	msg.Target = ""
 	msg.ID = c.generateMessageID("clear-state", poolName)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	err := c.sendStatePoolMessage(msg)
 	c.putWSMessage(msg)
@@ -1173,13 +1120,7 @@ func (c *Client) ClearStatePool(poolName string) error {
 func (c *Client) SaveStatePool(poolName string, directory string) error {
 	msg := c.getWSMessage()
 	msg.Type = "save_state_pool"
-	msg.Topic = ""
-	msg.Target = ""
 	msg.ID = c.generateMessageID("save-state", poolName+"-"+directory)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["directory"] = directory
 	err := c.sendStatePoolMessage(msg)
@@ -1191,13 +1132,7 @@ func (c *Client) SaveStatePool(poolName string, directory string) error {
 func (c *Client) LoadStatePool(poolName string, directory string) error {
 	msg := c.getWSMessage()
 	msg.Type = "load_state_pool"
-	msg.Topic = ""
-	msg.Target = ""
 	msg.ID = c.generateMessageID("load-state", poolName+"-"+directory)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["directory"] = directory
 	err := c.sendStatePoolMessage(msg)
@@ -1209,13 +1144,7 @@ func (c *Client) LoadStatePool(poolName string, directory string) error {
 func (c *Client) StopStatePool(poolName string) error {
 	msg := c.getWSMessage()
 	msg.Type = "stop_state_pool"
-	msg.Topic = ""
-	msg.Target = ""
 	msg.ID = c.generateMessageID("stop-state", poolName)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	err := c.sendStatePoolMessage(msg)
 	c.putWSMessage(msg)
@@ -1226,13 +1155,7 @@ func (c *Client) StopStatePool(poolName string) error {
 func (c *Client) RemoveStatePool(poolName string) error {
 	msg := c.getWSMessage()
 	msg.Type = "remove_state_pool"
-	msg.Topic = ""
-	msg.Target = ""
 	msg.ID = c.generateMessageID("remove-state", poolName)
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	err := c.sendStatePoolMessage(msg)
 	c.putWSMessage(msg)
@@ -1282,12 +1205,6 @@ func (c *Client) CreateActorPool(name string, size int) error {
 	msg := c.getWSMessage()
 	msg.Type = "create_actor_pool"
 	msg.ID = c.generateMessageID("create-actor", name)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["config"] = map[string]any{
 		"name": name,
 		"size": size,
@@ -1302,12 +1219,6 @@ func (c *Client) SendToActorPool(poolName string, data any) error {
 	msg := c.getWSMessage()
 	msg.Type = "actor_pool_message"
 	msg.ID = c.generateMessageID("send-actor", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	msg.Payload["data"] = data
 	err := c.sendActorPoolMessage(msg)
@@ -1336,12 +1247,6 @@ func (c *Client) StopActorPool(poolName string) error {
 	msg := c.getWSMessage()
 	msg.Type = "stop_actor_pool"
 	msg.ID = c.generateMessageID("stop-actor", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	err := c.sendActorPoolMessage(msg)
 	c.putWSMessage(msg)
@@ -1353,12 +1258,6 @@ func (c *Client) RemoveActorPool(poolName string) error {
 	msg := c.getWSMessage()
 	msg.Type = "remove_actor_pool"
 	msg.ID = c.generateMessageID("remove-actor", poolName)
-	msg.Topic = ""
-	msg.Target = ""
-	// Clear and reuse payload map
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
 	msg.Payload["pool"] = poolName
 	err := c.sendActorPoolMessage(msg)
 	c.putWSMessage(msg)
@@ -1409,8 +1308,6 @@ func (c *Client) putWSMessage(msg *WSMessage) {
 	msg.ID = ""
 	msg.Target = ""
 	msg.MsgID = ""
-	for k := range msg.Payload {
-		delete(msg.Payload, k)
-	}
+	clear(msg.Payload)
 	c.msgPool.Put(msg)
 }

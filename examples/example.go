@@ -8,7 +8,7 @@ import (
 	"github.com/kamalshkeir/lg"
 )
 
-func main() {
+func example() {
 	client, err := kactor.NewClient(kactor.ClientConfig{
 		Address: "localhost:9313",
 		Path:    "/ws/kactor",

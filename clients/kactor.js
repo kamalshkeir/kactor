@@ -1084,7 +1084,7 @@ class Kactor {
         }
 
         const msg = {
-            type: 'send_to_server',
+            type: 'publishToServer',
             id: messageId,
             payload: payload
         };

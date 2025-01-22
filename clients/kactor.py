@@ -918,7 +918,7 @@ class Kactor:
             
         message = {
             'id': msg_id,
-            'type': 'send_to_server',
+            'type': 'publishToServer',
             'payload': payload
         }
         

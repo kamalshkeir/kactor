@@ -73,7 +73,9 @@ func (a *Actor) Stop() {
 	a.mu.Lock()
 	if !a.stopped {
 		a.stopped = true
-		close(a.done)
+		if a.done != nil {
+			close(a.done)
+		}
 	}
 	a.mu.Unlock()
 	a.processWg.Wait()
