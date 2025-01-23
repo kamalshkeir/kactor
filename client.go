@@ -115,17 +115,34 @@ type ClientConfig struct {
 	Address       string
 	Path          string
 	Secure        bool
-	ClientID      string
+	ID            string
 	AutoReconnect bool
 	MaxRetries    int
 	BackoffMin    time.Duration
 	BackoffMax    time.Duration
 }
 
+func (c *Client) ID() string {
+	return c.config.ID
+}
+func (c *Client) Conn() *wspool.Conn {
+	return c.conn
+}
+func (c *Client) IsConnected() bool {
+	return c.isConnected
+}
+func (c *Client) Config() *ClientConfig {
+	return &c.config
+}
+
+func (c *Client) Handlers() *kmap.SafeMap[string, func(map[string]any, Subscription)] {
+	return c.handlers
+}
+
 // NewClient creates a new WebSocket client
 func NewClient(config ClientConfig) (*Client, error) {
-	if config.ClientID == "" {
-		config.ClientID = fmt.Sprintf("client-%d", time.Now().UnixNano())
+	if config.ID == "" {
+		config.ID = fmt.Sprintf("client-%d", time.Now().UnixNano())
 	}
 	if config.Address == "" {
 		config.Address = "localhost:9313"
@@ -158,7 +175,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 	if client.debug {
-		client.debugLog("Connected as %s to %s%s", client.config.ClientID, config.Address, config.Path)
+		client.debugLog("Connected as %s to %s%s", client.config.ID, config.Address, config.Path)
 		client.debugLines()
 	}
 	return client, nil
@@ -344,7 +361,7 @@ func (c *Client) reconnect() {
 }
 
 func (c *Client) generateMessageID(topic, subID string) string {
-	s := c.config.ClientID
+	s := c.config.ID
 	if topic != "" {
 		s += "-" + topic
 	}
@@ -405,7 +422,7 @@ func (c *Client) waitForResponse(messageID string, timeout time.Duration) (*WSMe
 // Subscribe subscribes to a topic
 func (c *Client) Subscribe(topic string, subID string, handler func(map[string]any, Subscription)) Subscription {
 	if subID == "" {
-		subID = c.config.ClientID
+		subID = c.config.ID
 	}
 	messageID := "sub-" + ksmux.GenerateID()
 	msg := c.getWSMessage()
@@ -475,6 +492,94 @@ func (c *Client) Publish(topic string, payload map[string]any, opts *PublishOpti
 	if c.debug {
 		c.debugTitle("Publishing...")
 		c.debugLog("publishing to topic='%s' payload='%+v' opts='%+v'", topic, payload, opts)
+	}
+
+	if opts == nil {
+		if c.debug {
+			c.debugLog("no ack")
+		}
+		msg.Payload["no_ack"] = true
+		err := c.conn.WriteJSON(msg)
+		return err == nil
+	}
+
+	// Create response channel before sending
+	respChan := make(chan *WSMessage, 1)
+	c.pending.Set(messageID, respChan)
+
+	err := c.conn.WriteJSON(msg)
+	if err != nil {
+		c.pending.Delete(messageID)
+		close(respChan)
+		if opts.OnFailure != nil {
+			opts.OnFailure(err)
+		}
+		return false
+	}
+
+	// Wait for response
+	if c.debug {
+		c.debugLog("start wait for %s", messageID)
+	}
+	resp, err := c.waitForResponse(messageID, 5*time.Second)
+	if err != nil {
+		if opts.OnFailure != nil {
+			opts.OnFailure(err)
+		}
+		return false
+	}
+	if c.debug {
+		c.debugLog("finish wait for %s", messageID)
+	}
+	success := resp != nil && resp.Type == "published"
+	if success {
+		if opts.OnSuccess != nil {
+			if c.debug {
+				c.debugLog("OnSuccess Publish case triggering fn")
+			}
+			opts.OnSuccess()
+		} else if c.debug {
+			c.debugLog("no handler OnSuccess")
+		}
+	} else if opts.OnFailure != nil {
+		if resp != nil && resp.Type == "error" {
+			if c.debug {
+				c.debugLog("OnFail Publish case triggering fn")
+			}
+			if errMsg, ok := resp.Payload["error"].(string); ok {
+				if c.debug {
+					c.debugLog("triggering OnFailure with err %s", errMsg)
+				}
+				opts.OnFailure(fmt.Errorf("%s", errMsg))
+			} else {
+				if c.debug {
+					c.debugLog("triggering OnFailure with default err pub fail")
+				}
+				opts.OnFailure(fmt.Errorf("publish failed"))
+			}
+		} else {
+			if c.debug {
+				c.debugLog("response is nil or resp.Type not error")
+			}
+			opts.OnFailure(fmt.Errorf("publish failed"))
+		}
+	}
+
+	c.putWSMessage(resp)
+	return success
+}
+
+// Publish publishes a message to a topic
+func (c *Client) sendToServer(address string, payload map[string]any, opts *PublishOptions) bool {
+	messageID := "sendToServer-" + ksmux.GenerateID()
+	msg := c.getWSMessage()
+	defer c.putWSMessage(msg)
+	msg.Type = "server_message"
+	msg.ID = messageID
+	msg.Payload = payload
+	if c.debug {
+		c.debugTitle("Publishing...")
+		c.debugLog("publishing to address='%s' payload='%+v'", address, payload)
 	}
 
 	if opts == nil {

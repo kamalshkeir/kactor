@@ -68,7 +68,7 @@ class Subscription {
 class Kactor {
   final String address;
   final String path;
-  final String clientId;
+  final String id;
   final bool secure;
   final bool autoReconnect;
   final int maxRetries;
@@ -89,14 +89,14 @@ class Kactor {
   Kactor({
     this.address = 'localhost:9313',
     this.path = '/ws/kactor',
-    String? clientId,
+    String? id,
     this.secure = false,
     this.autoReconnect = true,
     this.maxRetries = 5,
     this.backoffMin = 100,
     this.backoffMax = 5000,
     this.onOpen,
-  }) : clientId = clientId ?? _generateDefaultClientId() {
+  }) : id = id ?? _generateDefaultClientId() {
     _connect().catchError((e) {
       print('Initial connection failed: $e');
     });
@@ -205,8 +205,8 @@ class Kactor {
         final target = data['target'] as String? ?? '';
         final payload = data['payload'];
         
-        // Try topic+target first, then fall back to topic+clientId
-        var subInfo = _subscriptions['$topic-$target'] ?? _subscriptions['$topic-$clientId'];
+        // Try topic+target first, then fall back to topic+id
+        var subInfo = _subscriptions['$topic-$target'] ?? _subscriptions['$topic-$id'];
         
         if (subInfo != null) {
           final handler = subInfo['handler'] as Function?;
@@ -524,7 +524,7 @@ class Kactor {
       throw Exception('Not connected');
     }
 
-    subId = subId.isEmpty ? clientId : subId;
+    subId = subId.isEmpty ? id : subId;
     final messageId = _generateMessageId();
     final completer = Completer<dynamic>();
     _pendingMessages[messageId] = completer;

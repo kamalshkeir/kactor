@@ -47,7 +47,7 @@ type BusServer struct {
 	pools        *kmap.SafeMap[string, *StatefulActorPool]
 	actorPools   *kmap.SafeMap[string, *ActorPool]
 	serversConns *kmap.SafeMap[string, *Client]
-	onServerData func(map[string]any)
+	onServerData []func(map[string]any)
 	// Message pool for better memory reuse
 	messagePool *MessagePool
 	// Connection tracking
@@ -220,6 +220,15 @@ func (b *BusServer) HandleWS(c *ksmux.Context) {
 		}
 
 		switch msg.Type {
+		case "server_message":
+			if sm, ok := msg.Payload["server_addr"].(string); ok {
+				if b.onServerData != nil && sm == b.app.Address() {
+					for _, fn := range b.onServerData {
+						fn(msg.Payload)
+					}
+				}
+				continue
+			}
 		case "publish":
 			if b.debug {
 				b.debugLog("[handlerPublish] got msg %+v", msg)
@@ -1149,9 +1158,31 @@ func (b *BusServer) StatefulPools() *kmap.SafeMap[string, *StatefulActorPool] {
 func (b *BusServer) App() *ksmux.Router {
 	return b.app
 }
-
+func (b *BusServer) Path() string {
+	return b.path
+}
+func (b *BusServer) Router() *ksmux.Router {
+	return b.app
+}
+func (b *BusServer) Connections() *kmap.SafeMap[string, *wspool.Conn] {
+	return b.connections
+}
+func (b *BusServer) ServerConnections() *kmap.SafeMap[string, *Client] {
+	return b.serversConns
+}
+func (b *BusServer) WithCustomRouter(router *ksmux.Router) *BusServer {
+	b.app = router
+	return b
+}
 func (b *BusServer) Bus() *PubSub {
 	return b.bus
+}
+func (b *BusServer) PubSub() *PubSub {
+	return b.bus
+}
+func (b *BusServer) WithCustomPubsub(ps *PubSub) *BusServer {
+	b.bus = ps
+	return b
 }
 
 func (b *BusServer) Run() {
@@ -1189,9 +1220,9 @@ func (b *BusServer) PublishToServer(secure bool, serverAddr string, msg map[stri
 	if !exists {
 		var err error
 		client, err = NewClient(ClientConfig{
-			Address:  serverAddr,
-			ClientID: "server-" + serverAddr,
-			Secure:   secure,
+			Address: serverAddr,
+			ID:      "server-" + serverAddr,
+			Secure:  secure,
 			Path: func() string {
 				if len(path) > 0 {
 					return path[0]
@@ -1214,7 +1245,7 @@ func (b *BusServer) PublishToServer(secure bool, serverAddr string, msg map[stri
 	// Send message to target server
 	msg["server_addr"] = serverAddr
 	msg["from_server"] = b.app.Address()
-	success := client.Publish("server_message", msg, opts)
+	success := client.sendToServer(serverAddr, msg, opts)
 	if !success {
 		if b.debug {
 			b.debugLog("Failed to publish message to server %s", serverAddr)
@@ -1253,7 +1284,7 @@ func (b *BusServer) Stop() {
 
 // OnServerData triggered when this server receive data from another server
 func (b *BusServer) OnServerData(fn func(map[string]any)) {
-	b.onServerData = fn
+	b.onServerData = append(b.onServerData, fn)
 }
 
 // WithDebug enables or disables debug logging

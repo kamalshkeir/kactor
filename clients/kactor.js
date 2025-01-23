@@ -38,16 +38,16 @@ class PublishOptions {
 class Kactor {
     /**
      * @param {Object} config - Configuration object
-     * @param {string} [config.address='localhost:9313'] - Server address
+     * @param {string} [config.address=window.location.host] - Server address
      * @param {string} [config.path='/ws/kactor'] - WebSocket path
-     * @param {string} [config.clientId] - Unique client identifier
+     * @param {string} [config.id] - Unique client identifier
      * @param {boolean} [config.secure=false] - Whether to use wss://
      * @param {Function} [config.onOpen] - Callback when connection is established
      */
     constructor(config = {}) {
-        this.address = config.address || 'localhost:9313';
+        this.address = config.address || window.location.host;
         this.path = config.path || '/ws/kactor';
-        this.clientId = config.clientId || this._generateDefaultClientId();
+        this.id = config.id || this._generateDefaultClientId();
         this.secure = config.secure || false;
         
         this.ws = null;
@@ -598,8 +598,8 @@ class Kactor {
      */
     async subscribe(topic, subId, handler) {
         try {
-            // Use clientID as default subID if empty
-            subId = subId || this.clientId;
+            // Use client.id as default subID if empty
+            subId = subId || this.id;
 
             const messageId = Math.random().toString(36).substring(2, 15);
             const msg = {

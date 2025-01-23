@@ -37,7 +37,7 @@ class KactorConfig:
     """Configuration for the WebSocket client."""
     address: str = "localhost:9313"
     path: str = "/ws/kactor"
-    client_id: str = ""
+    id: str = ""
     secure: bool = False
     auto_reconnect: bool = True
     max_retries: int = 5
@@ -75,7 +75,7 @@ class Kactor:
             config: KactorConfig object containing:
                 - address: Server address (e.g. 'localhost:9313')
                 - path: WebSocket path (e.g. '/ws/kactor')
-                - client_id: Unique client identifier (auto-generated if not provided)
+                - id: Unique client identifier (auto-generated if not provided)
                 - secure: Whether to use wss:// (default: False)
                 - auto_reconnect: Whether to auto reconnect (default: True)
                 - max_retries: Max reconnection attempts (default: 5)
@@ -87,8 +87,8 @@ class Kactor:
             config = KactorConfig(**config)
             
         self.config = config
-        if not self.config.client_id:
-            self.config.client_id = f'client-{int(time.time())}-{"".join(random.choices(string.ascii_letters + string.digits, k=6))}'
+        if not self.config.id:
+            self.config.id = f'client-{int(time.time())}-{"".join(random.choices(string.ascii_letters + string.digits, k=6))}'
             
         self.ws: Optional[WebSocketClientProtocol] = None
         self.connected = False
@@ -603,8 +603,8 @@ class Kactor:
         if not self.ws or not self.connected:
             raise ConnectionError("Not connected")
             
-        # Use clientID as default subID if empty
-        sub_id = sub_id or self.config.client_id
+        # Use client.id as default subID if empty
+        sub_id = sub_id or self.config.id
         
         msg_id = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
         message = {

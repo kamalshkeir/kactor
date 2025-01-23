@@ -5,7 +5,7 @@ void main() async {
   final client = Client(
     address: 'localhost:9313',
     path: '/ws/kactor',
-    clientId: 'dart-client',
+    id: 'dart-client',
     secure: false,
     autoReconnect: true,
     maxRetries: 5,

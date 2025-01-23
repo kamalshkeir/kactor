@@ -23,7 +23,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client
 		client, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-client-1",
+			ID:            "bench-client-1",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})
@@ -91,7 +91,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client
 		client, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-client-1",
+			ID:            "bench-client-1",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})
@@ -159,7 +159,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client
 		client, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-client-2",
+			ID:            "bench-client-2",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})
@@ -280,7 +280,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client for subscriber
 		subClient, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-sub-client",
+			ID:            "bench-sub-client",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})
@@ -326,7 +326,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 			// Create client for publisher
 			pubClient, err := NewClient(ClientConfig{
 				Address:       "localhost:9888",
-				ClientID:      fmt.Sprintf("bench-pub-client-%d", time.Now().UnixNano()),
+				ID:            fmt.Sprintf("bench-pub-client-%d", time.Now().UnixNano()),
 				Path:          "/ws/kactor",
 				AutoReconnect: true,
 			})
@@ -365,7 +365,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client for subscribers
 		subClient, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-sub-client-multi",
+			ID:            "bench-sub-client-multi",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})
@@ -421,7 +421,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 			// Create client for publisher
 			pubClient, err := NewClient(ClientConfig{
 				Address:       "localhost:9888",
-				ClientID:      fmt.Sprintf("bench-pub-client-multi-%d", time.Now().UnixNano()),
+				ID:            fmt.Sprintf("bench-pub-client-multi-%d", time.Now().UnixNano()),
 				Path:          "/ws/kactor",
 				AutoReconnect: true,
 			})
@@ -461,7 +461,7 @@ func BenchmarkWebSocketPubSub(b *testing.B) {
 		// Create client
 		client, err := NewClient(ClientConfig{
 			Address:       "localhost:9888",
-			ClientID:      "bench-client-direct",
+			ID:            "bench-client-direct",
 			Path:          "/ws/kactor",
 			AutoReconnect: true,
 		})

@@ -27,7 +27,7 @@
                     const client = new Kactor({
                         address: "localhost:9313",
                         path: "/ws/kactor",
-                        clientId: "test-client-js",
+                        id: "test-client-js",
                         secure: false,
                         onOpen: () => {
                             log("✓ Connected to server");
@@ -194,7 +194,7 @@
 
                 // Test removeTopicHandler
                 const testTopic = 'test-topic-handler-removal';
-                await client.subscribe(testTopic, client.clientId, (message) => {
+                await client.subscribe(testTopic, client.id, (message) => {
                     log('Topic message received (should not see this):', message);
                 });
                 client.removeTopicHandler(testTopic);

@@ -12,7 +12,7 @@ void main() {
     connectionEstablished = Completer<void>();
     client = Kactor(
       address: "localhost:9313",
-      clientId: "test-client",
+      id: "test-client",
       onOpen: () => connectionEstablished.complete(),
     );
 
