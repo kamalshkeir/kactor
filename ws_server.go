@@ -1245,8 +1245,10 @@ func (b *BusServer) PublishToServer(secure bool, serverAddr string, msg map[stri
 	// Send message to target server
 	msg["server_addr"] = serverAddr
 	msg["from_server"] = b.app.Address()
+	msg["from_secure"] = b.app.IsTls()
 	success := client.sendToServer(serverAddr, msg, opts)
 	if !success {
+		b.serversConns.Delete(serverAddr)
 		if b.debug {
 			b.debugLog("Failed to publish message to server %s", serverAddr)
 		}

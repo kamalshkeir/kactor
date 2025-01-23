@@ -2,6 +2,8 @@ module github.com/kamalshkeir/kactor
 
 go 1.23.4
 
+replace github.com/kamalshkeir/ksmux => ../ksmux
+
 require (
 	github.com/kamalshkeir/kmap v1.1.8
 	github.com/kamalshkeir/ksmux v0.6.8

@@ -1003,17 +1003,17 @@ func (c *Client) unsubscribe(topic, subID string) {
 }
 
 // Close closes the WebSocket connection
-func (c *Client) Close() error {
+func (c *Client) Close() {
 	if c.debug {
 		c.debugLog("closing client")
 	}
 	if c.conn != nil {
-		return c.conn.Close()
+		c.conn.Close()
 	}
 	if c.debug {
 		c.debugLog("closed")
 	}
-	return nil
+	return
 }
 
 type clientSubscription struct {
