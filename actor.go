@@ -1,6 +1,7 @@
 package kactor
 
 import (
+	"fmt"
 	"math/bits"
 	"runtime"
 	"sync"
@@ -10,11 +11,10 @@ import (
 type Message interface{}
 
 type messageQueue struct {
-	_      [8]uint64
+	mu     sync.RWMutex // Add mutex for queue operations
 	buffer []Message
 	head   int32
 	tail   int32
-	_      [8]uint64
 }
 
 type Actor struct {
@@ -25,7 +25,7 @@ type Actor struct {
 	processWg   sync.WaitGroup
 	workerCount int32
 	mask        int32
-	mu          sync.Mutex
+	mu          sync.RWMutex // Add mutex for actor state
 	stopped     bool
 }
 
@@ -35,6 +35,9 @@ func NewActor(queueSize, batchSize int, handler func(msgs []Message)) *Actor {
 	}
 	if batchSize <= 0 {
 		batchSize = 8192
+	}
+	if handler == nil {
+		panic("handler cannot be nil")
 	}
 
 	queueSize = 1 << uint(32-bits.LeadingZeros32(uint32(queueSize-1)))
@@ -58,11 +61,24 @@ func NewActor(queueSize, batchSize int, handler func(msgs []Message)) *Actor {
 }
 
 func (a *Actor) Start() {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		panic("cannot start a stopped actor")
+	}
+	a.mu.Unlock()
+
 	workerCount := atomic.LoadInt32(&a.workerCount)
 	a.processWg.Add(int(workerCount))
 
 	for i := 0; i < int(workerCount); i++ {
 		go func(id int) {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("Worker %d recovered from panic: %v\n", id, r)
+				}
+				a.processWg.Done()
+			}()
 			runtime.LockOSThread()
 			a.processBatch(id)
 		}(i)
@@ -81,10 +97,22 @@ func (a *Actor) Stop() {
 	a.processWg.Wait()
 }
 
-//go:nosplit
-//go:noinline
 func (a *Actor) Send(msg Message, workerID int) bool {
+	if msg == nil {
+		return false
+	}
+
+	a.mu.RLock()
+	if a.stopped {
+		a.mu.RUnlock()
+		return false
+	}
+	a.mu.RUnlock()
+
 	q := &a.queues[workerID]
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
 	tail := atomic.LoadInt32(&q.tail)
 	nextTail := (tail + 1) & a.mask
 
@@ -97,10 +125,7 @@ func (a *Actor) Send(msg Message, workerID int) bool {
 	return true
 }
 
-//go:nosplit
 func (a *Actor) processBatch(workerID int) {
-	defer a.processWg.Done()
-
 	q := &a.queues[workerID]
 	batch := make([]Message, a.batchSize)
 	localHead := atomic.LoadInt32(&q.head)
@@ -109,6 +134,7 @@ func (a *Actor) processBatch(workerID int) {
 		select {
 		case <-a.done:
 			// Process any remaining messages before exiting
+			q.mu.RLock()
 			tail := atomic.LoadInt32(&q.tail)
 			if localHead != tail {
 				available := int((tail - localHead) & a.mask)
@@ -120,13 +146,25 @@ func (a *Actor) processBatch(workerID int) {
 					batch[i] = q.buffer[idx]
 					idx = (idx + 1) & a.mask
 				}
-				a.handler(batch[:available])
+				q.mu.RUnlock()
+
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Printf("Handler recovered from panic: %v\n", r)
+						}
+					}()
+					a.handler(batch[:available])
+				}()
+			} else {
+				q.mu.RUnlock()
 			}
 			return
 		default:
+			q.mu.RLock()
 			tail := atomic.LoadInt32(&q.tail)
 			if localHead == tail {
-				// No messages, check done channel more frequently
+				q.mu.RUnlock()
 				runtime.Gosched()
 				continue
 			}
@@ -141,10 +179,19 @@ func (a *Actor) processBatch(workerID int) {
 				batch[i] = q.buffer[idx]
 				idx = (idx + 1) & a.mask
 			}
+			q.mu.RUnlock()
 
 			localHead = (localHead + int32(available)) & a.mask
 			atomic.StoreInt32(&q.head, localHead)
-			a.handler(batch[:available])
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Printf("Handler recovered from panic: %v\n", r)
+					}
+				}()
+				a.handler(batch[:available])
+			}()
 		}
 	}
 }
