@@ -1,11 +1,5 @@
 package kactor
 
-import (
-	"runtime"
-	"sync"
-	"testing"
-)
-
 // cpu: Intel(R) Core(TM) i5-7300HQ CPU @ 2.50GHz
 // BenchmarkActorVsChannel
 // BenchmarkActorVsChannel/Actor/\x01
@@ -45,209 +39,209 @@ import (
 // BenchmarkActorBackPressure
 // BenchmarkActorBackPressure-4                            15562069                68.67 ns/op            0 B/op          0 allocs/op
 
-type benchMessage struct {
-	value int64
-}
+// type benchMessage struct {
+// 	value int64
+// }
 
-// BenchmarkActorVsChannel runs comparative benchmarks between Actor and channels
-func BenchmarkActorVsChannel(b *testing.B) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	sizes := []int{1, 10, 100, 1000, 10000}
+// // BenchmarkActorVsChannel runs comparative benchmarks between Actor and channels
+// func BenchmarkActorVsChannel(b *testing.B) {
+// 	runtime.GOMAXPROCS(runtime.NumCPU())
+// 	sizes := []int{1, 10, 100, 1000, 10000}
 
-	for _, size := range sizes {
-		// Benchmark Actor
-		b.Run("Actor/"+string(rune(size)), func(b *testing.B) {
-			actor := NewActor(0, size, func(msgs []Message) {
-				// Process messages in batch
-				for range msgs {
-					// Simulate work
-					runtime.Gosched()
-				}
-			})
-			actor.Start()
-			defer actor.Stop()
+// 	for _, size := range sizes {
+// 		// Benchmark Actor
+// 		b.Run("Actor/"+string(rune(size)), func(b *testing.B) {
+// 			actor := NewActor(0, size, func(msgs []Message) {
+// 				// Process messages in batch
+// 				for range msgs {
+// 					// Simulate work
+// 					runtime.Gosched()
+// 				}
+// 			})
+// 			actor.Start()
+// 			defer actor.Stop()
 
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				msg := benchMessage{value: 1}
-				workerID := 0
-				for pb.Next() {
-					actor.Send(msg, workerID)
-				}
-			})
-		})
+// 			b.ResetTimer()
+// 			b.RunParallel(func(pb *testing.PB) {
+// 				msg := benchMessage{value: 1}
+// 				workerID := 0
+// 				for pb.Next() {
+// 					actor.Send(msg, workerID)
+// 				}
+// 			})
+// 		})
 
-		// Benchmark Channel with Buffer
-		b.Run("BufferedChannel/"+string(rune(size)), func(b *testing.B) {
-			ch := make(chan benchMessage, size)
-			var wg sync.WaitGroup
-			wg.Add(1)
+// 		// Benchmark Channel with Buffer
+// 		b.Run("BufferedChannel/"+string(rune(size)), func(b *testing.B) {
+// 			ch := make(chan benchMessage, size)
+// 			var wg sync.WaitGroup
+// 			wg.Add(1)
 
-			// Start consumer
-			go func() {
-				defer wg.Done()
-				batch := make([]benchMessage, size)
-				count := 0
+// 			// Start consumer
+// 			go func() {
+// 				defer wg.Done()
+// 				batch := make([]benchMessage, size)
+// 				count := 0
 
-				for msg := range ch {
-					batch[count] = msg
-					count++
+// 				for msg := range ch {
+// 					batch[count] = msg
+// 					count++
 
-					if count == size {
-						// Process batch
-						for range batch[:count] {
-							runtime.Gosched()
-						}
-						count = 0
-					}
-				}
+// 					if count == size {
+// 						// Process batch
+// 						for range batch[:count] {
+// 							runtime.Gosched()
+// 						}
+// 						count = 0
+// 					}
+// 				}
 
-				// Process remaining messages
-				if count > 0 {
-					for range batch[:count] {
-						runtime.Gosched()
-					}
-				}
-			}()
+// 				// Process remaining messages
+// 				if count > 0 {
+// 					for range batch[:count] {
+// 						runtime.Gosched()
+// 					}
+// 				}
+// 			}()
 
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				msg := benchMessage{value: 1}
-				for pb.Next() {
-					ch <- msg
-				}
-			})
+// 			b.ResetTimer()
+// 			b.RunParallel(func(pb *testing.PB) {
+// 				msg := benchMessage{value: 1}
+// 				for pb.Next() {
+// 					ch <- msg
+// 				}
+// 			})
 
-			b.StopTimer()
-			close(ch)
-			wg.Wait()
-		})
+// 			b.StopTimer()
+// 			close(ch)
+// 			wg.Wait()
+// 		})
 
-		// Benchmark Multiple Goroutines with Channels
-		b.Run("MultiGoroutine/"+string(rune(size)), func(b *testing.B) {
-			numWorkers := runtime.NumCPU()
-			channels := make([]chan benchMessage, numWorkers)
-			var wg sync.WaitGroup
+// 		// Benchmark Multiple Goroutines with Channels
+// 		b.Run("MultiGoroutine/"+string(rune(size)), func(b *testing.B) {
+// 			numWorkers := runtime.NumCPU()
+// 			channels := make([]chan benchMessage, numWorkers)
+// 			var wg sync.WaitGroup
 
-			// Create channels and start workers
-			for i := 0; i < numWorkers; i++ {
-				channels[i] = make(chan benchMessage, size)
-				wg.Add(1)
+// 			// Create channels and start workers
+// 			for i := 0; i < numWorkers; i++ {
+// 				channels[i] = make(chan benchMessage, size)
+// 				wg.Add(1)
 
-				go func(ch chan benchMessage) {
-					defer wg.Done()
-					batch := make([]benchMessage, size)
-					count := 0
+// 				go func(ch chan benchMessage) {
+// 					defer wg.Done()
+// 					batch := make([]benchMessage, size)
+// 					count := 0
 
-					for msg := range ch {
-						batch[count] = msg
-						count++
+// 					for msg := range ch {
+// 						batch[count] = msg
+// 						count++
 
-						if count == size {
-							// Process batch
-							for range batch[:count] {
-								runtime.Gosched()
-							}
-							count = 0
-						}
-					}
+// 						if count == size {
+// 							// Process batch
+// 							for range batch[:count] {
+// 								runtime.Gosched()
+// 							}
+// 							count = 0
+// 						}
+// 					}
 
-					// Process remaining messages
-					if count > 0 {
-						for range batch[:count] {
-							runtime.Gosched()
-						}
-					}
-				}(channels[i])
-			}
+// 					// Process remaining messages
+// 					if count > 0 {
+// 						for range batch[:count] {
+// 							runtime.Gosched()
+// 						}
+// 					}
+// 				}(channels[i])
+// 			}
 
-			b.ResetTimer()
-			b.RunParallel(func(pb *testing.PB) {
-				msg := benchMessage{value: 1}
-				workerID := 0
-				for pb.Next() {
-					channels[workerID] <- msg
-					workerID = (workerID + 1) % numWorkers
-				}
-			})
+// 			b.ResetTimer()
+// 			b.RunParallel(func(pb *testing.PB) {
+// 				msg := benchMessage{value: 1}
+// 				workerID := 0
+// 				for pb.Next() {
+// 					channels[workerID] <- msg
+// 					workerID = (workerID + 1) % numWorkers
+// 				}
+// 			})
 
-			b.StopTimer()
-			for _, ch := range channels {
-				close(ch)
-			}
-			wg.Wait()
-		})
-	}
-}
+// 			b.StopTimer()
+// 			for _, ch := range channels {
+// 				close(ch)
+// 			}
+// 			wg.Wait()
+// 		})
+// 	}
+// }
 
-// BenchmarkActorThroughput measures message throughput
-func BenchmarkActorThroughput(b *testing.B) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// // BenchmarkActorThroughput measures message throughput
+// func BenchmarkActorThroughput(b *testing.B) {
+// 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	actor := NewActor(0, 8192, func(msgs []Message) {
-		for range msgs {
-			runtime.Gosched()
-		}
-	})
-	actor.Start()
-	defer actor.Stop()
+// 	actor := NewActor(0, 8192, func(msgs []Message) {
+// 		for range msgs {
+// 			runtime.Gosched()
+// 		}
+// 	})
+// 	actor.Start()
+// 	defer actor.Stop()
 
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		msg := benchMessage{value: 1}
-		workerID := 0
-		for pb.Next() {
-			actor.Send(msg, workerID)
-		}
-	})
-}
+// 	b.ResetTimer()
+// 	b.RunParallel(func(pb *testing.PB) {
+// 		msg := benchMessage{value: 1}
+// 		workerID := 0
+// 		for pb.Next() {
+// 			actor.Send(msg, workerID)
+// 		}
+// 	})
+// }
 
-// BenchmarkActorLatency measures message latency
-func BenchmarkActorLatency(b *testing.B) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// // BenchmarkActorLatency measures message latency
+// func BenchmarkActorLatency(b *testing.B) {
+// 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	done := make(chan struct{})
-	actor := NewActor(0, 1, func(msgs []Message) {
-		for range msgs {
-			done <- struct{}{}
-		}
-	})
-	actor.Start()
-	defer actor.Stop()
+// 	done := make(chan struct{})
+// 	actor := NewActor(0, 1, func(msgs []Message) {
+// 		for range msgs {
+// 			done <- struct{}{}
+// 		}
+// 	})
+// 	actor.Start()
+// 	defer actor.Stop()
 
-	msg := benchMessage{value: 1}
-	b.ResetTimer()
+// 	msg := benchMessage{value: 1}
+// 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		actor.Send(msg, 0)
-		<-done
-	}
-}
+// 	for i := 0; i < b.N; i++ {
+// 		actor.Send(msg, 0)
+// 		<-done
+// 	}
+// }
 
-// BenchmarkActorBackPressure tests behavior under back pressure
-func BenchmarkActorBackPressure(b *testing.B) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// // BenchmarkActorBackPressure tests behavior under back pressure
+// func BenchmarkActorBackPressure(b *testing.B) {
+// 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	slowActor := NewActor(1<<16, 100, func(msgs []Message) {
-		// Simulate slow processing
-		for range msgs {
-			runtime.Gosched()
-			runtime.Gosched()
-			runtime.Gosched()
-		}
-	})
-	slowActor.Start()
-	defer slowActor.Stop()
+// 	slowActor := NewActor(1<<16, 100, func(msgs []Message) {
+// 		// Simulate slow processing
+// 		for range msgs {
+// 			runtime.Gosched()
+// 			runtime.Gosched()
+// 			runtime.Gosched()
+// 		}
+// 	})
+// 	slowActor.Start()
+// 	defer slowActor.Stop()
 
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		msg := benchMessage{value: 1}
-		workerID := 0
-		successCount := 0
-		for pb.Next() {
-			if slowActor.Send(msg, workerID) {
-				successCount++
-			}
-		}
-	})
-}
+// 	b.ResetTimer()
+// 	b.RunParallel(func(pb *testing.PB) {
+// 		msg := benchMessage{value: 1}
+// 		workerID := 0
+// 		successCount := 0
+// 		for pb.Next() {
+// 			if slowActor.Send(msg, workerID) {
+// 				successCount++
+// 			}
+// 		}
+// 	})
+// }
