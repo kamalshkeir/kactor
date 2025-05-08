@@ -13,10 +13,6 @@ type PubSub struct {
 	patterns    *kmap.SafeMap[string, *psSubList]
 	pendingMsgs *kmap.SafeMap[string, *PublishOptions]
 
-	// Pre-allocated buffers for common topics
-	topicBufs [32][]byte
-	topicLen  [32]int32
-
 	msgPool     sync.Pool
 	payloadPool sync.Pool
 	idPool      sync.Pool
@@ -35,15 +31,6 @@ type WSMessage struct {
 	Target  string         `json:"target,omitempty"`  // Target for direct messages
 	Payload map[string]any `json:"payload,omitempty"` // Message payload
 	MsgID   string         `json:"msg_id,omitempty"`  // Unique message ID for acknowledgment
-}
-
-func (msg *WSMessage) reset() {
-	clear(msg.Payload)
-	msg.Topic = ""
-	msg.Target = ""
-	msg.ID = ""
-	msg.Type = ""
-	msg.MsgID = ""
 }
 
 type RetryConfig struct {
@@ -95,7 +82,6 @@ type psMessage struct {
 	topic    string
 	targetID string
 	payload  map[string]any
-	acks     *kmap.SafeMap[string, bool]
 	options  *PublishOptions
 	pending  int32
 	msgID    []byte

@@ -133,14 +133,6 @@ func (ps *PubSub) getPayload() map[string]any {
 	return m
 }
 
-// putPayload returns a payload map to the pool
-func (ps *PubSub) putPayload(p map[string]any) {
-	for k := range p {
-		delete(p, k)
-	}
-	ps.payloadPool.Put(p)
-}
-
 // getMessage gets a message from the pool
 func (ps *PubSub) getMessage() *psMessage {
 	msg := ps.msgPool.Get().(*psMessage)
@@ -241,22 +233,6 @@ func (ps *PubSub) getOrCreateList(m *kmap.SafeMap[string, *psSubList], topic str
 		m.Set(topic, list)
 	}
 	return list
-}
-
-// formatUint64 writes an unsigned integer to a byte slice, returning number of bytes written
-func formatUint64(buf []byte, i uint64) int {
-	// Assemble decimal in reverse order
-	var b [20]byte
-	bp := len(b) - 1
-	for i >= 10 {
-		q := i / 10
-		b[bp] = byte('0' + i - q*10)
-		bp--
-		i = q
-	}
-	b[bp] = byte('0' + i)
-	// Copy to output
-	return copy(buf, b[bp:])
 }
 
 // Publish publishes a message
@@ -466,10 +442,8 @@ func (ps *PubSub) PublishWithRetry(topic string, payload map[string]any, cfg *Re
 	}
 
 	// Copy payload
-	if payload != nil {
-		for k, v := range payload {
-			msg.payload[k] = v
-		}
+	for k, v := range payload {
+		msg.payload[k] = v
 	}
 
 	success := false
@@ -524,10 +498,8 @@ func (ps *PubSub) PublishToWithRetry(topic string, targetID string, payload map[
 	}
 
 	// Copy payload
-	if payload != nil {
-		for k, v := range payload {
-			msg.payload[k] = v
-		}
+	for k, v := range payload {
+		msg.payload[k] = v
 	}
 
 	success := false
@@ -790,57 +762,6 @@ func (ps *PubSub) HasSubscribers(topic string) bool {
 		ps.debugLog("=== CHECKING SUBSCRIBERS END ===")
 	}
 	return false
-}
-
-// Helper method to get all subscribers for a topic
-func (ps *PubSub) getSubscribers(topic string) []string {
-	// Get slice from pool
-	subscribers := ps.subsPool.Get().([]string)
-	subscribers = subscribers[:0] // Reset length but keep capacity
-
-	if list, exists := ps.subscribers.Get(topic); exists {
-		list.mu.RLock()
-		for i := int32(0); i < atomic.LoadInt32(&list.count); i++ {
-			if node := list.subs[i]; node != nil {
-				subscribers = append(subscribers, node.subID)
-			}
-		}
-		list.mu.RUnlock()
-	}
-	return subscribers
-}
-
-// putSubscribers returns a subscriber slice to the pool
-func (ps *PubSub) putSubscribers(subs []string) {
-	subs = subs[:0] // Reset length but keep capacity
-	ps.subsPool.Put(subs)
-}
-
-// retryPublish is a helper method to retry publish to specific subscribers
-func (ps *PubSub) retryPublish(topic string, msgID string, unackedSubs []string) {
-	// Get payload from pool
-	payload := ps.getPayload()
-	payload["msg_id"] = msgID
-
-	if list, exists := ps.subscribers.Get(topic); exists {
-		list.mu.RLock()
-		for i := int32(0); i < atomic.LoadInt32(&list.count); i++ {
-			if node := list.subs[i]; node != nil {
-				for _, subID := range unackedSubs {
-					if node.subID == subID {
-						// Retry delivery to this subscriber
-						if node.handler != nil {
-							node.handler(payload, node.sub)
-						}
-					}
-				}
-			}
-		}
-		list.mu.RUnlock()
-	}
-
-	// Return payload to pool
-	ps.putPayload(payload)
 }
 
 // SubscribeWS adds a subscriber with a WebSocket connection reference

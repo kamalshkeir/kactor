@@ -31,12 +31,6 @@ func (m PoolMessage) GetData() any {
 	return m.Data
 }
 
-// MessageContext holds the message and its associated connection
-type MessageContext struct {
-	msg  *WSMessage
-	conn *wspool.Conn
-}
-
 // BusServer handles WebSocket connections and message routing
 type BusServer struct {
 	id           string
@@ -54,7 +48,6 @@ type BusServer struct {
 	connections *kmap.SafeMap[string, *wspool.Conn]
 	// Batch processing channels
 	batchSize int
-	batchChan chan *MessageContext
 	// Add write buffer pool
 	writeBufferPool sync.Pool
 	// Add JSON encoder pool
@@ -93,7 +86,6 @@ func NewBusServer(config ...ksmux.Config) *BusServer {
 		messagePool:  NewMessagePool(),
 		connections:  kmap.New[string, *wspool.Conn](32),
 		batchSize:    100,
-		batchChan:    make(chan *MessageContext, 1000),
 		// Initialize buffer pool
 		writeBufferPool: sync.Pool{
 			New: func() interface{} {
@@ -541,17 +533,6 @@ func (b *BusServer) HandleWS(c *ksmux.Context) {
 			b.sendErrorWS("type not handled", msg, conn)
 		}
 	}
-}
-
-// publishMessage represents a message to be published
-type publishMessage struct {
-	msg  *WSMessage
-	conn *wspool.Conn
-}
-
-// Implement Message interface for publishMessage
-func (m *publishMessage) GetData() any {
-	return m.msg
 }
 
 // MessagePool manages a pool of WSMessage objects
@@ -1299,62 +1280,4 @@ func (b *BusServer) WithDebug(enabled bool) *BusServer {
 // Update the LowAllocPubSub interface to use wspool.Conn
 func (b *BusServer) CleanupConnection(conn *wspool.Conn) {
 	b.bus.CleanupConnection(conn)
-}
-
-func (b *BusServer) handleSubscribe(ctx *MessageContext) {
-	// Subscribe to topic
-	sub := b.bus.Subscribe(ctx.msg.Topic, ctx.msg.Target, func(payload map[string]any, sub Subscription) {
-		response := b.messagePool.Get()
-		response.Type = "message"
-		response.Topic = ctx.msg.Topic
-		response.Target = ctx.msg.Target
-		response.ID = ctx.msg.ID
-		// Copy payload data
-		for k, v := range payload {
-			response.Payload[k] = v
-		}
-		// Send response and return to pool
-		ctx.conn.WriteJSON(response)
-		b.messagePool.Put(response)
-	})
-
-	if sub == nil {
-		response := b.messagePool.Get()
-		response.Type = "error"
-		response.ID = ctx.msg.ID
-		response.Topic = ctx.msg.Topic
-		response.Target = ctx.msg.Target
-		response.Payload["error"] = "failed to subscribe"
-		ctx.conn.WriteJSON(response)
-		b.messagePool.Put(response)
-		return
-	}
-
-	// Send immediate subscription confirmation
-	response := b.messagePool.Get()
-	response.Type = "subscribed"
-	response.Topic = ctx.msg.Topic
-	response.ID = ctx.msg.ID
-	response.Target = ctx.msg.Target
-	response.Payload["subID"] = ctx.msg.Target
-	// Send synchronously to ensure subscription is confirmed before any publishes
-	ctx.conn.WriteJSON(response)
-	b.messagePool.Put(response)
-}
-
-func (b *BusServer) handlePoolMessage(ctx *MessageContext) {
-	switch ctx.msg.Type {
-	case "actor_pool_message":
-		if err := b.handleActorPoolMessage(ctx.msg, ctx.conn); err != nil {
-			if b.debug {
-				b.debugLog("Error handling actor pool message: %v", err)
-			}
-		}
-	case "state_pool_message":
-		if err := b.handleStatePoolMessage(ctx.msg, ctx.conn); err != nil {
-			if b.debug {
-				b.debugLog("Error handling state pool message: %v", err)
-			}
-		}
-	}
 }

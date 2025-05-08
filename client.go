@@ -1013,7 +1013,6 @@ func (c *Client) Close() {
 	if c.debug {
 		c.debugLog("closed")
 	}
-	return
 }
 
 type clientSubscription struct {
