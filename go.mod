@@ -1,6 +1,6 @@
 module github.com/kamalshkeir/kactor
 
-go 1.23.4
+go 1.24.3
 
 require (
 	github.com/kamalshkeir/kmap v1.1.8
@@ -9,7 +9,7 @@ require (
 )
 
 require (
-	github.com/kamalshkeir/kstrct v1.9.18 // indirect
+	github.com/kamalshkeir/kstrct v1.9.19 // indirect
 	golang.org/x/crypto v0.38.0 // indirect
 	golang.org/x/net v0.40.0 // indirect
 	golang.org/x/text v0.25.0 // indirect

@@ -38,6 +38,46 @@ type RetryConfig struct {
 	MaxBackoff  int // maximum number of yields (runtime.Gosched()) in backoff
 }
 
+// MessagePool manages a pool of WSMessage objects
+type MessagePool struct {
+	pool sync.Pool
+}
+
+func NewMessagePool() *MessagePool {
+	return &MessagePool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &WSMessage{
+					Payload: make(map[string]any),
+				}
+			},
+		},
+	}
+}
+
+// Get gets a message from the pool
+func (p *MessagePool) Get() *WSMessage {
+	return p.pool.Get().(*WSMessage)
+}
+
+// Put returns a message to the pool
+func (p *MessagePool) Put(msg *WSMessage) {
+	msg.Type = ""
+	msg.Topic = ""
+	msg.ID = ""
+	msg.Target = ""
+	msg.MsgID = ""
+	for k := range msg.Payload {
+		delete(msg.Payload, k)
+	}
+	p.pool.Put(msg)
+}
+
+// WSMessage implements Message interface
+func (m *WSMessage) GetData() any {
+	return m
+}
+
 var DefaultRetryConfig = RetryConfig{
 	MaxAttempts: 3,
 	MaxBackoff:  4,
@@ -58,7 +98,7 @@ type Subscription interface {
 // psSubList is a fixed-size array of subscribers for a topic
 type psSubList struct {
 	mu    sync.RWMutex
-	subs  [32]*psSubNode // Fixed size array for zero allocation
+	subs  [32]*psSubNode
 	count int32
 }
 
@@ -86,4 +126,15 @@ type psMessage struct {
 	pending  int32
 	msgID    []byte
 	idBuf    []byte
+}
+
+// PoolMessage represents a message sent to an actor pool
+type PoolMessage struct {
+	ClientID string
+	Data     any
+}
+
+// Implement Message interface for PoolMessage
+func (m PoolMessage) GetData() any {
+	return m.Data
 }

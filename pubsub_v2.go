@@ -11,7 +11,6 @@ import (
 
 	"github.com/kamalshkeir/kmap"
 	"github.com/kamalshkeir/ksmux/ws"
-	"github.com/kamalshkeir/ksmux/wspool"
 )
 
 // NewPubSub creates a new PubSub
@@ -224,6 +223,86 @@ func (ps *PubSub) Subscribe(topic, subID string, handler func(map[string]any, Su
 		}
 	}
 	return nil
+}
+
+// CleanupConnection cleans up resources associated with a WebSocket connection
+func (ps *PubSub) CleanupConnection(conn *ws.Conn) {
+	if ps.debug {
+		ps.debugLog("Starting cleanup for connection %p", conn)
+	}
+
+	// Clean up direct subscriptions
+	ps.subscribers.Range(func(topic string, list *psSubList) bool {
+		list.mu.Lock()
+		// Find and remove all subscriptions for this connection
+		for i := int32(0); i < list.count; i++ {
+			if node := list.subs[i]; node != nil {
+				if ps.debug {
+					ps.debugLog("Cleanup Check: Topic='%s', NodeSubID='%s', NodeConn=%p, TargetConn=%p, Match=%t",
+						topic, node.subID, node.conn, conn, node.conn == conn)
+				}
+				if node.conn == conn {
+					// Move last element to this position
+					lastIdx := atomic.LoadInt32(&list.count) - 1
+					list.subs[i] = list.subs[lastIdx]
+					list.subs[lastIdx] = nil
+					atomic.AddInt32(&list.count, -1)
+					atomic.AddInt32(&ps.userCount, -1)
+					i-- // Recheck this position since we moved an element here
+				}
+			}
+		}
+		list.mu.Unlock()
+
+		// If no more subscriptions for this topic, remove the topic
+		if atomic.LoadInt32(&list.count) == 0 {
+			if ps.debug {
+				ps.debugLog("Removing empty topic %s", topic)
+			}
+			ps.subscribers.Delete(topic)
+		}
+		return true
+	})
+
+	// Clean up pattern subscriptions
+	ps.patterns.Range(func(pattern string, list *psSubList) bool {
+		list.mu.Lock()
+		// Find and remove all subscriptions for this connection
+		for i := int32(0); i < list.count; i++ {
+			if node := list.subs[i]; node != nil {
+				if ps.debug {
+					ps.debugLog("Cleanup Check (Pattern): Pattern='%s', NodeSubID='%s', NodeConn=%p, TargetConn=%p, Match=%t",
+						pattern, node.subID, node.conn, conn, node.conn == conn)
+				}
+				if node.conn == conn {
+					if ps.debug {
+						ps.debugLog("Removing pattern subscription for connection %p from pattern %s", conn, pattern)
+					}
+					// Move last element to this position
+					lastIdx := atomic.LoadInt32(&list.count) - 1
+					list.subs[i] = list.subs[lastIdx]
+					list.subs[lastIdx] = nil
+					atomic.AddInt32(&list.count, -1)
+					atomic.AddInt32(&ps.userCount, -1)
+					i-- // Recheck this position since we moved an element here
+				}
+			}
+		}
+		list.mu.Unlock()
+
+		// If no more subscriptions for this pattern, remove the pattern
+		if atomic.LoadInt32(&list.count) == 0 {
+			if ps.debug {
+				ps.debugLog("Removing empty pattern %s", pattern)
+			}
+			ps.patterns.Delete(pattern)
+		}
+		return true
+	})
+
+	if ps.debug {
+		ps.debugLog("Finished cleanup for connection %p", conn)
+	}
 }
 
 func (ps *PubSub) getOrCreateList(m *kmap.SafeMap[string, *psSubList], topic string) *psSubList {
@@ -546,77 +625,6 @@ func (ps *PubSub) Close() {
 	}
 }
 
-// CleanupConnection cleans up resources associated with a WebSocket connection
-func (ps *PubSub) CleanupConnection(conn *wspool.Conn) {
-	if ps.debug {
-		ps.debugLog("Starting cleanup for connection %p", conn)
-	}
-
-	// Clean up direct subscriptions
-	ps.subscribers.Range(func(topic string, list *psSubList) bool {
-		list.mu.Lock()
-		// Find and remove all subscriptions for this connection
-		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.conn == conn.WSConn() {
-				if ps.debug {
-					ps.debugLog("Removing subscription for connection %p from topic %s", conn, topic)
-				}
-				// Move last element to this position
-				lastIdx := atomic.LoadInt32(&list.count) - 1
-				list.subs[i] = list.subs[lastIdx]
-				list.subs[lastIdx] = nil
-				atomic.AddInt32(&list.count, -1)
-				atomic.AddInt32(&ps.userCount, -1)
-				i-- // Recheck this position since we moved an element here
-			}
-		}
-		list.mu.Unlock()
-
-		// If no more subscriptions for this topic, remove the topic
-		if atomic.LoadInt32(&list.count) == 0 {
-			if ps.debug {
-				ps.debugLog("Removing empty topic %s", topic)
-			}
-			ps.subscribers.Delete(topic)
-		}
-		return true
-	})
-
-	// Clean up pattern subscriptions
-	ps.patterns.Range(func(pattern string, list *psSubList) bool {
-		list.mu.Lock()
-		// Find and remove all subscriptions for this connection
-		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.conn == conn.WSConn() {
-				if ps.debug {
-					ps.debugLog("Removing pattern subscription for connection %p from pattern %s", conn, pattern)
-				}
-				// Move last element to this position
-				lastIdx := atomic.LoadInt32(&list.count) - 1
-				list.subs[i] = list.subs[lastIdx]
-				list.subs[lastIdx] = nil
-				atomic.AddInt32(&list.count, -1)
-				atomic.AddInt32(&ps.userCount, -1)
-				i-- // Recheck this position since we moved an element here
-			}
-		}
-		list.mu.Unlock()
-
-		// If no more subscriptions for this pattern, remove the pattern
-		if atomic.LoadInt32(&list.count) == 0 {
-			if ps.debug {
-				ps.debugLog("Removing empty pattern %s", pattern)
-			}
-			ps.patterns.Delete(pattern)
-		}
-		return true
-	})
-
-	if ps.debug {
-		ps.debugLog("Finished cleanup for connection %p", conn)
-	}
-}
-
 // CleanupClient removes all subscriptions for a client
 func (ps *PubSub) CleanupClient(clientID string) {
 	if ps.debug {
@@ -779,15 +787,26 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 
 		// Check if we already have this subscription
 		for i := int32(0); i < list.count; i++ {
-			if node := list.subs[i]; node != nil && node.subID == subID {
-				// Update the connection reference if it's a WebSocket subscription
+			node := list.subs[i]
+			if node != nil && node.subID == subID {
 				if node.conn != nil {
+					if node.conn == conn {
+						atomic.AddInt32(&ps.userCount, -1) // Decrement if already subscribed with the same conn
+						return node.sub
+					} else {
+						goto create_new_node_for_pattern_subscription // Jump to pattern-specific creation logic
+					}
+				} else {
 					node.conn = conn
+					if ps.debug {
+						ps.debugLog("SubscribeWS: Associated conn %p with existing non-WS subID '%s' on pattern '%s'", conn, subID, topic)
+					}
+					return node.sub
 				}
-				return node.sub
 			}
 		}
 
+	create_new_node_for_pattern_subscription: // Label for creating a new node in pattern subscriptions
 		// Find empty slot
 		for i := int32(0); i < 32; i++ {
 			if list.subs[i] == nil {
@@ -799,6 +818,7 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 				return sub
 			}
 		}
+		atomic.AddInt32(&ps.userCount, -1) // Decrement if no slot found for pattern
 		return nil
 	}
 
@@ -809,14 +829,30 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 
 	// Check if we already have this subscription
 	for i := int32(0); i < list.count; i++ {
-		if node := list.subs[i]; node != nil && node.subID == subID {
-			// Update the connection reference if it's a WebSocket subscription
+		node := list.subs[i]
+		if node != nil && node.subID == subID {
 			if node.conn != nil {
+				if node.conn == conn {
+					atomic.AddInt32(&ps.userCount, -1) // Decrement if already subscribed with the same conn
+					return node.sub
+				} else {
+					goto create_new_node_for_conn_new // This jumps to the existing label for direct subscriptions
+				}
+			} else {
 				node.conn = conn
+				if ps.debug {
+					ps.debugLog("SubscribeWS: Associated conn %p with existing non-WS subID '%s' on topic '%s'", conn, subID, topic)
+				}
+				return node.sub
 			}
-			return node.sub
 		}
 	}
+
+create_new_node_for_conn_new:
+	// Logique pour trouver un slot vide et créer un nouveau psSubNode
+	// pour subID et conn_new.
+	// ... (créer sub, assigner list.subs[new_idx], mettre à jour list.count, etc.)
+	// (Déverrouiller le mutex et retourner le nouveau sub)
 
 	// Find empty slot
 	for i := int32(0); i < 32; i++ {
@@ -829,6 +865,7 @@ func (ps *PubSub) SubscribeWS(topic, subID string, handler func(map[string]any, 
 			return sub
 		}
 	}
+	atomic.AddInt32(&ps.userCount, -1) // Decrement if no slot found
 	return nil
 }
 
