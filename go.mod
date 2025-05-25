@@ -4,7 +4,7 @@ go 1.24.3
 
 require (
 	github.com/kamalshkeir/kmap v1.1.8
-	github.com/kamalshkeir/ksmux v0.7.3
+	github.com/kamalshkeir/ksmux v0.7.4
 	github.com/kamalshkeir/lg v0.1.4
 )
 
